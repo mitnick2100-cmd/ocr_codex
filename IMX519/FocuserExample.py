@@ -37,12 +37,29 @@ from Autofocus import AutoFocus
 global image_count
 image_count = 0
 
+# IMX519 在目前 Jetson 驅動可穩定使用的輸出幀率。
+# 15 FPS 會使用 3840x2160 感測器模式並由 Argus 降速輸出。
+FPS_OPTIONS = (9, 15, 17, 60, 120)
+SENSOR_MODES = {
+    9: (4656, 3496),
+    15: (3840, 2160),
+    17: (3840, 2160),
+    60: (1920, 1080),
+    120: (1280, 720),
+}
+
 # 曝光時間每次按鍵調整的步進值（毫秒）
 EXPOSURE_STEP_MS = 1.0
 # 曝光時間下限（毫秒），避免設成0或負值
 EXPOSURE_MIN_MS = 0.1
-# 相對於 1/framerate 的安全係數，避免曝光時間超過單一畫格的時間
+# 曝光最多使用單一畫格的 95%，保留少量時序安全裕度
 EXPOSURE_MAX_RATIO = 0.95
+# IMX519 驅動回報的硬體曝光上限（683709000 ns）。
+EXPOSURE_SENSOR_MAX_MS = 683.709
+
+# 對焦設定：步階固定 50，縮短等待時間以加快自動對焦掃描。
+FOCUS_STEP = 50
+FOCUS_SETTLE_TIME = 0.05
 
 KEY_LEFT = (2424832, 65361, 81)
 KEY_UP = (2490368, 65362, 82)
@@ -51,7 +68,28 @@ KEY_DOWN = (2621440, 65364, 84)
 
 
 def max_exposure_ms(framerate):
-    return (1000.0 / framerate) * EXPOSURE_MAX_RATIO
+    if framerate <= 0:
+        raise ValueError("framerate must be greater than zero")
+    frame_limit_ms = (1000.0 / framerate) * EXPOSURE_MAX_RATIO
+    return min(frame_limit_ms, EXPOSURE_SENSOR_MAX_MS)
+
+
+def sensor_mode_for_fps(framerate):
+    try:
+        return SENSOR_MODES[framerate]
+    except KeyError as exc:
+        raise ValueError(
+            "Unsupported FPS {}. Choose one of {}".format(
+                framerate, ", ".join(map(str, FPS_OPTIONS))
+            )
+        ) from exc
+
+
+def clamp_exposure_ms(exposure_ms, framerate):
+    if exposure_ms is None:
+        return None
+    return min(max(float(exposure_ms), EXPOSURE_MIN_MS),
+               max_exposure_ms(framerate))
 
 
 def reopen_camera_with_exposure(camera, cam_state, focuser=None):
@@ -73,6 +111,8 @@ def reopen_camera_with_exposure(camera, cam_state, focuser=None):
         exposure_time_ns=exposure_ns,
         gain_range=cam_state['gain_range'],
         ae_lock=(cam_state['exposure_ms'] is not None),
+        capture_width=cam_state['capture_width'],
+        capture_height=cam_state['capture_height'],
     )
 
     if focuser is not None:
@@ -114,14 +154,20 @@ def draw_overlay(frame, key, focuser, cam_state, auto_focus):
     else:
         shutter_value = "Shutter: Auto"
 
+    fps_text = "FPS: {} ({}x{})".format(
+        cam_state['framerate'],
+        cam_state['capture_width'],
+        cam_state['capture_height'],
+    )
     key_text = "Last key: {}".format(key) if key >= 0 else "Last key: None"
     lines = [
         "Arducam Controller",
         focus_value,
         autofocus_value,
         shutter_value,
+        fps_text,
         key_text,
-        "Q/Esc exit | C snapshot | A auto exposure | Left/Right or [/] shutter",
+        "Q/Esc exit | C snapshot | A auto exposure | [/] shutter | -/= FPS",
         "Up/Down or W/S focus | Enter/F autofocus | R reset focus",
     ]
     for index, line in enumerate(lines):
@@ -137,9 +183,9 @@ def parse_cmdline():
                         help='Camera preview width. Default: 1280')
     parser.add_argument('--height', type=int, default=720,
                         help='Camera preview height. Default: 720')
-    parser.add_argument('--framerate', type=int, default=15,
-                        help='Camera framerate. Exposure time cannot exceed 1/framerate seconds, '
-                             'lower the framerate if you need a longer exposure. Default: 15')
+    parser.add_argument('--framerate', type=int, choices=FPS_OPTIONS, default=17,
+                        help='IMX519 FPS. Supported: {}. Default: 17'.format(
+                            ', '.join(map(str, FPS_OPTIONS))))
     parser.add_argument('--exposure', type=float, default=None,
                         help='Initial exposure time in milliseconds (e.g. 20 for a 1/50s shutter). '
                              'If not set, auto exposure is used at startup.')
@@ -149,14 +195,36 @@ def parse_cmdline():
 
     return parser.parse_args()
 
+
+def change_framerate(camera, cam_state, focuser, direction):
+    current_index = FPS_OPTIONS.index(cam_state['framerate'])
+    new_index = max(0, min(len(FPS_OPTIONS) - 1, current_index + direction))
+    new_fps = FPS_OPTIONS[new_index]
+    if new_fps == cam_state['framerate']:
+        return
+
+    capture_width, capture_height = sensor_mode_for_fps(new_fps)
+    cam_state['framerate'] = new_fps
+    cam_state['capture_width'] = capture_width
+    cam_state['capture_height'] = capture_height
+    cam_state['exposure_ms'] = clamp_exposure_ms(
+        cam_state['exposure_ms'], new_fps
+    )
+    reopen_camera_with_exposure(camera, cam_state, focuser)
+
+
 # parse input key
 def parseKey(k,focuser,auto_focus,camera,cam_state):
     global image_count
-    focus_step  = 50
+    focus_step = FOCUS_STEP
 
     key8 = k & 0xFF
 
-    if k in KEY_RIGHT or key8 == ord(']'):
+    if key8 in (ord('-'), ord('_')):
+        change_framerate(camera, cam_state, focuser, -1)
+    elif key8 in (ord('='), ord('+')):
+        change_framerate(camera, cam_state, focuser, 1)
+    elif k in KEY_RIGHT or key8 == ord(']'):
         # 拉長曝光時間 -> 快門變慢，有助於拍到完整的LED看板數字
         current = cam_state['exposure_ms'] if cam_state['exposure_ms'] is not None else 0.0
         upper_bound = max_exposure_ms(cam_state['framerate'])
@@ -191,8 +259,8 @@ def draw_menu(camera, i2c_bus, cam_state):
     auto_focus = AutoFocus(
         focuser, camera,
         roi=(0.4, 0.4, 0.2, 0.2),   # 對焦要看的區域 (x, y, width, height)，比例0~1
-        focus_step=50,              # 每步移動量
-        move_settle_time=0.1,      # 每步移動後等待秒數
+        focus_step=FOCUS_STEP,       # 每步移動量
+        move_settle_time=FOCUS_SETTLE_TIME,  # 每步移動後等待秒數
         decline_patience=5,         # 連續下降幾次判定結束
         verbose=False,               # 想在終端機看每一步的清晰度數值可以打開
     )
@@ -227,26 +295,34 @@ def main():
     args = parse_cmdline()
 
     gain_range = args.gain if args.gain else None
-    exposure_ns = int(args.exposure * 1000000) if args.exposure is not None else None
+    capture_width, capture_height = sensor_mode_for_fps(args.framerate)
+    exposure_ms = clamp_exposure_ms(args.exposure, args.framerate)
+    if args.exposure is not None and exposure_ms != args.exposure:
+        print("Exposure clamped from {:.3f} ms to {:.3f} ms for {} FPS".format(
+            args.exposure, exposure_ms, args.framerate
+        ))
+    exposure_ns = int(exposure_ms * 1000000) if exposure_ms is not None else None
 
-    # cam_state 集中保存目前相機的曝光/增益/畫質設定，
-    # 供 parseKey() 調整快門時重新開啟相機使用
     cam_state = {
         'width': args.width,
         'height': args.height,
         'framerate': args.framerate,
-        'exposure_ms': args.exposure,   # None 代表自動曝光
+        'exposure_ms': exposure_ms,   # None 代表自動曝光
         'gain_range': gain_range,
+        'capture_width': capture_width,
+        'capture_height': capture_height,
     }
 
-    #open camera
+    # open camera
     camera = Camera(
         width=args.width,
         height=args.height,
         framerate=args.framerate,
         exposure_time_ns=exposure_ns,
         gain_range=gain_range,
-        ae_lock=(args.exposure is not None),
+        ae_lock=(exposure_ms is not None),
+        capture_width=capture_width,
+        capture_height=capture_height,
     )
     print("Using I2C bus:", args.i2c_bus)
     try:

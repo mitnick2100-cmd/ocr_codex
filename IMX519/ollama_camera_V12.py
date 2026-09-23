@@ -1,0 +1,721 @@
+import base64
+import argparse
+import re
+import sys
+import threading
+import time
+from queue import Full, Queue
+from pathlib import Path
+
+import cv2
+import numpy as np
+import requests
+import torch
+from ultralytics import YOLO
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+IMX519_DIR = SCRIPT_DIR / "IMX519"
+if IMX519_DIR.exists():
+    sys.path.insert(0, str(IMX519_DIR))
+
+from JetsonCamera import Camera
+from Focuser import Focuser
+from Autofocus import AutoFocus
+
+# =========================
+# Ollama 設定
+# =========================
+OLLAMA_URL = "http://192.168.0.110:11434/api/chat"
+MODEL_NAME = "qwen3-vl:4B-instruct"
+OLLAMA_NUM_CTX = 1024
+
+# =========================
+# GPU / YOLO
+# =========================
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", device)
+
+model = None
+half = device == "cuda"
+
+FPS_OPTIONS = (9, 15, 17, 60, 120)
+SENSOR_MODES = {
+    9: (4656, 3496),
+    15: (3840, 2160),
+    17: (3840, 2160),
+    60: (1920, 1080),
+    120: (1280, 720),
+}
+EXPOSURE_MIN_MS = 0.1
+EXPOSURE_MAX_RATIO = 0.95
+EXPOSURE_SENSOR_MAX_MS = 683.709
+EXPOSURE_STEP_MS = 1.0
+FOCUS_STEP = 50
+FOCUS_SETTLE_TIME = 0.05
+
+KEY_LEFT = (2424832, 65361, 81)
+KEY_UP = (2490368, 65362, 82)
+KEY_RIGHT = (2555904, 65363, 83)
+KEY_DOWN = (2621440, 65364, 84)
+
+# =========================
+# 執行參數
+# =========================
+GRACE_FRAMES = 15
+OCR_FRAME_INTERVAL = 5
+OCR_INTERVAL_SECONDS = 1.0
+OCR_QUEUE_SIZE = 2
+CONFIRMATIONS_REQUIRED = 2
+
+# 小於 32 px 的圖片會讓 qwen3-vl runner 回 500；V12 先保留小 ROI，再放大後送出。
+OLLAMA_MIN_IMAGE_SIDE = 32
+TARGET_OCR_MIN_SIDE = 96
+MAX_OCR_SIDE = 512
+MIN_SOURCE_ROI_WIDTH = 4
+MIN_SOURCE_ROI_HEIGHT = 4
+MIN_SOURCE_ROI_AREA = 48
+
+# =========================
+# 共用狀態
+# =========================
+confirmed_buses = {}
+last_seen_frame = {}
+last_ocr_time = {}
+ocr_history = {}
+ocr_pending_ids = set()
+ocr_queue = Queue(maxsize=OCR_QUEUE_SIZE)
+lock = threading.Lock()
+ollama_session = requests.Session()
+ollama_session.trust_env = False
+
+
+def encode_frame(frame):
+    """將 OpenCV BGR 影像編碼成 Ollama 可接受的 JPEG Base64。"""
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not ok:
+        raise ValueError("無法將 ROI 編碼為 JPEG")
+    return base64.b64encode(buffer).decode("utf-8")
+
+
+def warmup_ollama():
+    """預載入模型並保持在 VRAM，減少第一個 OCR 任務的等待時間。"""
+    print("Ollama warming up...")
+    dummy = upscale_for_ocr(np.zeros((10, 10, 3), dtype=np.uint8))
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": "warmup"},
+            {"role": "user", "content": "OK", "images": [encode_frame(dummy)]},
+        ],
+        "stream": False,
+        "keep_alive": -1,
+        "options": {"num_ctx": OLLAMA_NUM_CTX},
+    }
+
+    try:
+        response = ollama_session.post(OLLAMA_URL, json=payload, timeout=60)
+        response.raise_for_status()
+        print("Ollama ready (kept alive in VRAM)")
+    except requests.RequestException as error:
+        print("warmup failed:", error)
+
+
+# =========================
+# ROI 影像增強（僅處理亮度通道）
+# =========================
+def build_gamma_lut(gamma: float) -> np.ndarray:
+    """建立 gamma LUT。gamma > 1 變暗，gamma < 1 變亮。"""
+    if gamma <= 0:
+        raise ValueError("gamma 必須大於 0")
+    table = np.array(
+        [((value / 255.0) ** gamma) * 255 for value in range(256)],
+        dtype=np.uint8,
+    )
+    return table
+
+
+def apply_gamma(image: np.ndarray, gamma: float) -> np.ndarray:
+    """依 gamma 套用亮度校正；方向與 build_gamma_lut 的說明一致。"""
+    return cv2.LUT(image, build_gamma_lut(gamma))
+
+
+def highlight_rolloff(luma: np.ndarray, knee: float = 0.80,
+                      strength: float = 0.65) -> np.ndarray:
+    """只壓縮高於 knee 的亮度，盡量保留 LED 高光邊緣。"""
+    image_f = luma.astype(np.float32) / 255.0
+    compressed = image_f.copy()
+    mask = image_f > knee
+    over = (image_f - knee) / (1.0 - knee + 1e-6)
+    compressed[mask] = knee + (1.0 - knee) * (over[mask] ** (1.0 + strength))
+    return np.clip(compressed * 255.0, 0, 255).astype(np.uint8)
+
+
+def overexposed_ratio(image: np.ndarray, threshold: int = 250) -> float:
+    """計算近乎死白的亮度像素比例。"""
+    luma = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    return float(np.count_nonzero(luma >= threshold) / luma.size)
+
+
+def auto_gamma(image: np.ndarray, target_mean: float = 128.0) -> float:
+    """估算把平均亮度調向 target_mean 的 gamma（>1 變暗，<1 變亮）。"""
+    luma = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    mean_brightness = float(np.clip(luma.mean(), 1.0, 254.0))
+    target = float(np.clip(target_mean, 1.0, 254.0))
+    gamma = np.log(target / 255.0) / np.log(mean_brightness / 255.0)
+    return float(np.clip(gamma, 0.55, 2.5))
+
+
+def unsharp_mask(image: np.ndarray, sigma: float = 0.8,
+                 strength: float = 0.65) -> np.ndarray:
+    """低強度銳化；應在去噪與對比調整後使用。"""
+    blurred = cv2.GaussianBlur(image, (0, 0), sigma)
+    return cv2.addWeighted(image, 1 + strength, blurred, -strength, 0)
+
+
+def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
+    """針對 LED 看板做條件式增強，不改變 BGR 色彩通道。
+
+    流程：LAB-L 亮度通道去噪 -> 依曝光狀態做高光壓縮或 CLAHE ->
+    必要時 gamma 校正 -> 輕度銳化。正常曝光且對比足夠的影像不會被強制
+    套用 gamma，避免損失數字與背景之間的細節。
+    """
+    if roi_img is None or roi_img.size == 0:
+        raise ValueError("ROI 不可為空")
+
+    lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
+    luma, channel_a, channel_b = cv2.split(lab)
+
+    # 先處理壓縮雜訊，避免銳化把夜間影片雜點放大。
+    luma = cv2.bilateralFilter(luma, d=5, sigmaColor=25, sigmaSpace=5)
+    mean_luma = float(luma.mean())
+    contrast = float(luma.std())
+    white_ratio = overexposed_ratio(luma)
+    clahe_used = False
+    gamma_used = None
+
+    if white_ratio >= 0.08 or mean_luma >= 165:
+        strategy = "overexposed"
+        luma = highlight_rolloff(luma)
+        gamma_used = auto_gamma(luma, target_mean=120.0)
+        luma = apply_gamma(luma, gamma_used)
+    elif mean_luma <= 115:
+        strategy = "dark"
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        luma = clahe.apply(luma)
+        gamma_used = auto_gamma(luma, target_mean=142.0)
+        luma = apply_gamma(luma, gamma_used)
+        clahe_used = True
+    elif contrast <= 35:
+        strategy = "low-contrast"
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        luma = clahe.apply(luma)
+        clahe_used = True
+    else:
+        strategy = "normal"
+
+    luma = unsharp_mask(luma)
+    enhanced = cv2.cvtColor(cv2.merge((luma, channel_a, channel_b)), cv2.COLOR_LAB2BGR)
+    gamma_text = f"{gamma_used:.2f}" if gamma_used is not None else "None"
+    print(
+        f"[enhance_roi] {strategy}, mean={mean_luma:.1f}, "
+        f"contrast={contrast:.1f}, white={white_ratio:.1%}, "
+        f"gamma={gamma_text}, CLAHE={clahe_used}"
+    )
+    return enhanced
+
+
+def upscale_for_ocr(roi_img: np.ndarray) -> np.ndarray:
+    """等比例放大 ROI，避免小圖觸發 500，並提升小看板 OCR 辨識率。"""
+    height, width = roi_img.shape[:2]
+    scale = max(
+        1.0,
+        OLLAMA_MIN_IMAGE_SIDE / width,
+        OLLAMA_MIN_IMAGE_SIDE / height,
+        TARGET_OCR_MIN_SIDE / width,
+        TARGET_OCR_MIN_SIDE / height,
+    )
+
+    max_scaled_side = max(width, height) * scale
+    if max_scaled_side > MAX_OCR_SIDE:
+        scale = MAX_OCR_SIDE / max(width, height)
+
+    if scale <= 1.0:
+        return roi_img
+
+    output_width = max(OLLAMA_MIN_IMAGE_SIDE, round(width * scale))
+    output_height = max(OLLAMA_MIN_IMAGE_SIDE, round(height * scale))
+    print(
+        f"[upscale_for_ocr] {width}x{height} -> "
+        f"{output_width}x{output_height}, scale={scale:.2f}"
+    )
+    return cv2.resize(
+        roi_img,
+        (output_width, output_height),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
+# =========================
+# 看板 ROI 擷取與驗證
+# =========================
+def extract_sign_roi(frame: np.ndarray, x1: int, y1: int,
+                     x2: int, y2: int) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """使用固定比例擷取車體上方 LED 看板區域。"""
+    frame_height, frame_width = frame.shape[:2]
+    x1, x2 = max(0, x1), min(frame_width, x2)
+    y1, y2 = max(0, y1), min(frame_height, y2)
+    width, height = x2 - x1, y2 - y1
+    if width <= 0 or height <= 0:
+        return frame[0:0, 0:0], (x1, y1, x1, y1)
+
+    roi_box = (
+        x1 + int(width * 0.06),
+        y1,
+        x2 - int(width * 0.06),
+        y1 + int(height * 0.3),
+    )
+    rx1, ry1, rx2, ry2 = roi_box
+    return frame[ry1:ry2, rx1:rx2], roi_box
+
+
+def is_valid_roi(roi_img: np.ndarray) -> bool:
+    """只過濾空圖或極端小圖；其餘小 ROI 交給 upscale_for_ocr 放大。"""
+    if roi_img is None or roi_img.size == 0:
+        return False
+    height, width = roi_img.shape[:2]
+    return (
+        width >= MIN_SOURCE_ROI_WIDTH
+        and height >= MIN_SOURCE_ROI_HEIGHT
+        and width * height >= MIN_SOURCE_ROI_AREA
+    )
+
+
+def normalize_ocr_result(result: str) -> str | None:
+    """只接受 1 至 4 位數字，避免模型說明文字進入投票確認。"""
+    compact = re.sub(r"\s+", "", result)
+    if compact.upper() == "NONE":
+        return None
+    return compact if re.fullmatch(r"\d{1,4}", compact) else None
+
+
+# =========================
+# OCR worker（受限佇列，避免多台車同時建立大量執行緒）
+# =========================
+def process_ocr(track_id: int, roi_img: np.ndarray):
+    prepared_roi = enhance_roi(upscale_for_ocr(roi_img))
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是公車 LED 號碼辨識系統。只能回傳 1 至 4 位數字；無法辨識時只回傳 NONE。",
+            },
+            {
+                "role": "user",
+                "content": "辨識圖片中的公車路線號碼。",
+                "images": [encode_frame(prepared_roi)],
+            },
+        ],
+        "stream": False,
+        "keep_alive": -1,
+        "options": {"num_ctx": OLLAMA_NUM_CTX},
+    }
+    response = ollama_session.post(OLLAMA_URL, json=payload, timeout=60)
+    response.raise_for_status()
+    raw_result = response.json()["message"]["content"].strip()
+    result = normalize_ocr_result(raw_result)
+    print(f"OCR [ID:{track_id}] = {raw_result!r}")
+
+    if result is None:
+        return
+
+    with lock:
+        history = ocr_history.get(track_id)
+        if history and history["last"] == result:
+            history["count"] += 1
+        else:
+            history = {"last": result, "count": 1}
+            ocr_history[track_id] = history
+
+        print(f"ID:{track_id} {result} ({history['count']}/{CONFIRMATIONS_REQUIRED})")
+        if history["count"] >= CONFIRMATIONS_REQUIRED:
+            confirmed_buses[track_id] = result
+            print(f"CONFIRMED [ID:{track_id}] {result}")
+
+
+def ocr_worker():
+    while True:
+        track_id, roi_img = ocr_queue.get()
+        try:
+            process_ocr(track_id, roi_img)
+        except (ValueError, cv2.error, requests.RequestException) as error:
+            print(f"OCR error [ID:{track_id}]:", error)
+        except Exception as error:
+            print(f"Unexpected OCR error [ID:{track_id}]:", error)
+        finally:
+            with lock:
+                ocr_pending_ids.discard(track_id)
+            ocr_queue.task_done()
+
+
+# =========================
+# YOLO detection
+# =========================
+def detect_bus(frame):
+    results = model.track(
+        frame,
+        imgsz=(768, 1280),
+        device=device,
+        classes=[5],
+        conf=0.5,
+        half=half,
+        persist=True,
+        verbose=False,
+        tracker="bytetrack.yaml",
+    )
+
+    buses = []
+    for result in results:
+        if result.boxes is None:
+            continue
+        for box in result.boxes:
+            if box.id is None:
+                continue
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            confidence = float(box.conf[0])
+            track_id = int(box.id[0])
+            buses.append((x1, y1, x2, y2, confidence, track_id))
+    return buses
+
+
+def schedule_ocr(track_id: int, roi_img: np.ndarray, now: float) -> bool:
+    """在冷卻時間、重複任務與佇列容量都允許時排入 OCR。"""
+    with lock:
+        if track_id in ocr_pending_ids:
+            return False
+        if now - last_ocr_time.get(track_id, 0.0) < OCR_INTERVAL_SECONDS:
+            return False
+        try:
+            ocr_queue.put_nowait((track_id, roi_img.copy()))
+        except Full:
+            return False
+        ocr_pending_ids.add(track_id)
+        last_ocr_time[track_id] = now
+        return True
+
+
+def get_visible_results(frame_id: int) -> list[str]:
+    """取得目前出現或仍在寬限期內、已確認的公車號碼。"""
+    with lock:
+        visible_ids = [
+            track_id
+            for track_id, last_frame in last_seen_frame.items()
+            if frame_id - last_frame <= GRACE_FRAMES and track_id in confirmed_buses
+        ]
+        return [confirmed_buses[track_id] for track_id in sorted(visible_ids)]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="V12 YOLO + Ollama OCR using Jetson IMX519 camera."
+    )
+    parser.add_argument("--width", type=int, default=1280,
+                        help="Preview width. Default: 1280")
+    parser.add_argument("--height", type=int, default=720,
+                        help="Preview height. Default: 720")
+    parser.add_argument("--framerate", type=int, choices=FPS_OPTIONS, default=17,
+                        help="IMX519 FPS. Supported: 9, 15, 17, 60, 120")
+    parser.add_argument("--exposure", type=float, default=None,
+                        help="Fixed exposure time in ms; default is auto exposure")
+    parser.add_argument("--gain", default="1 1",
+                        help='Fixed gain range, e.g. "1 1"; use "" for auto gain')
+    parser.add_argument("-i", "--i2c-bus", type=int, default=10,
+                        help="Focuser I2C bus. Default: 10")
+    parser.add_argument("--model", default=None,
+                        help="YOLO model path; default searches this folder and its parent")
+    parser.add_argument("--device", default=None,
+                        help="Inference device, e.g. 0, cpu; default auto")
+    return parser.parse_args()
+
+
+def max_exposure_ms(framerate: int) -> float:
+    if framerate <= 0:
+        raise ValueError("framerate must be greater than zero")
+    return min(
+        (1000.0 / framerate) * EXPOSURE_MAX_RATIO,
+        EXPOSURE_SENSOR_MAX_MS,
+    )
+
+
+def clamp_exposure_ms(exposure_ms: float | None, framerate: int) -> float | None:
+    if exposure_ms is None:
+        return None
+    return min(max(float(exposure_ms), EXPOSURE_MIN_MS), max_exposure_ms(framerate))
+
+
+def resolve_model_path(requested: str | None) -> str:
+    if requested:
+        candidate = Path(requested).expanduser()
+        if candidate.exists() or candidate.is_absolute():
+            return str(candidate)
+
+    for candidate in (SCRIPT_DIR / "yolov8n.pt", SCRIPT_DIR.parent / "yolov8n.pt"):
+        if candidate.exists():
+            return str(candidate)
+    return requested or "yolov8n.pt"
+
+
+def reopen_camera_with_exposure(camera, cam_state, focuser=None):
+    exposure_ms = cam_state["exposure_ms"]
+    exposure_ns = None if exposure_ms is None else int(exposure_ms * 1_000_000)
+    camera.reconfigure(
+        framerate=cam_state["framerate"],
+        exposure_time_ns=exposure_ns,
+        gain_range=cam_state["gain_range"],
+        ae_lock=exposure_ms is not None,
+        capture_width=cam_state["capture_width"],
+        capture_height=cam_state["capture_height"],
+    )
+    if focuser is not None:
+        focuser.reinit()
+
+
+def change_framerate(camera, cam_state, focuser, direction):
+    current_index = FPS_OPTIONS.index(cam_state["framerate"])
+    new_index = max(0, min(len(FPS_OPTIONS) - 1, current_index + direction))
+    new_fps = FPS_OPTIONS[new_index]
+    if new_fps == cam_state["framerate"]:
+        return
+
+    capture_width, capture_height = SENSOR_MODES[new_fps]
+    cam_state["framerate"] = new_fps
+    cam_state["capture_width"] = capture_width
+    cam_state["capture_height"] = capture_height
+    cam_state["exposure_ms"] = clamp_exposure_ms(
+        cam_state["exposure_ms"], new_fps
+    )
+    reopen_camera_with_exposure(camera, cam_state, focuser)
+
+
+def draw_control_overlay(frame, cam_state, focuser, auto_focus):
+    focus = focuser.get(Focuser.OPT_FOCUS)
+    if auto_focus.is_finished():
+        autofocus_text = "AutoFocus: Idle (best={})".format(auto_focus.best_position)
+    else:
+        autofocus_text = "AutoFocus: Running"
+
+    exposure_ms = cam_state["exposure_ms"]
+    exposure_text = "Exposure: Auto"
+    if exposure_ms is not None:
+        exposure_text = "Exposure: {:.2f} ms (~1/{:.0f}s)".format(
+            exposure_ms, 1000.0 / exposure_ms
+        )
+
+    lines = [
+        "Focus: {} | {}".format(focus, autofocus_text),
+        exposure_text,
+        "Camera: {} FPS ({}x{})".format(
+            cam_state["framerate"],
+            cam_state["capture_width"],
+            cam_state["capture_height"],
+        ),
+        "[/] exposure | -/= FPS | W/S or Up/Down focus | Enter/F autofocus",
+        "A auto exposure | R reset focus | C snapshot | Q/Esc exit",
+    ]
+    for index, text in enumerate(lines):
+        cv2.putText(frame, text, (20, 85 + index * 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(frame, text, (20, 85 + index * 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def handle_camera_key(key, camera, cam_state, focuser, auto_focus, frame):
+    key8 = key & 0xFF
+    if key8 in (ord("-"), ord("_")):
+        change_framerate(camera, cam_state, focuser, -1)
+    elif key8 in (ord("="), ord("+")):
+        change_framerate(camera, cam_state, focuser, 1)
+    elif key8 == ord("]") or key in KEY_RIGHT:
+        current = cam_state["exposure_ms"] or 0.0
+        cam_state["exposure_ms"] = min(
+            current + EXPOSURE_STEP_MS,
+            max_exposure_ms(cam_state["framerate"]),
+        )
+        reopen_camera_with_exposure(camera, cam_state, focuser)
+    elif key8 == ord("[") or key in KEY_LEFT:
+        if cam_state["exposure_ms"] is None:
+            cam_state["exposure_ms"] = max_exposure_ms(cam_state["framerate"])
+        cam_state["exposure_ms"] = max(
+            cam_state["exposure_ms"] - EXPOSURE_STEP_MS,
+            EXPOSURE_MIN_MS,
+        )
+        reopen_camera_with_exposure(camera, cam_state, focuser)
+    elif key8 in (ord("w"), ord("W")) or key in KEY_UP:
+        focuser.set(Focuser.OPT_FOCUS, focuser.get(Focuser.OPT_FOCUS) + FOCUS_STEP)
+    elif key8 in (ord("s"), ord("S")) or key in KEY_DOWN:
+        focuser.set(Focuser.OPT_FOCUS, focuser.get(Focuser.OPT_FOCUS) - FOCUS_STEP)
+    elif key8 in (ord("f"), ord("F"), 10, 13) or key == 65421:
+        auto_focus.start_focus()
+    elif key8 in (ord("r"), ord("R")):
+        focuser.reset(Focuser.OPT_FOCUS)
+    elif key8 in (ord("a"), ord("A")):
+        cam_state["exposure_ms"] = None
+        reopen_camera_with_exposure(camera, cam_state, focuser)
+    elif key8 in (ord("c"), ord("C")):
+        cv2.imwrite("v12_image.jpg", frame)
+        print("Saved snapshot: v12_image.jpg")
+
+
+def main():
+    global model, half, device
+
+    args = parse_args()
+    model_path = resolve_model_path(args.model)
+    inference_device = args.device or device
+    gain_range = args.gain if args.gain else None
+    capture_width, capture_height = SENSOR_MODES[args.framerate]
+    exposure_ms = clamp_exposure_ms(args.exposure, args.framerate)
+    exposure_ns = int(exposure_ms * 1_000_000) if exposure_ms is not None else None
+    cam_state = {
+        "framerate": args.framerate,
+        "exposure_ms": exposure_ms,
+        "gain_range": gain_range,
+        "capture_width": capture_width,
+        "capture_height": capture_height,
+    }
+
+    print(
+        "Opening IMX519: {}x{} @ {} FPS, sensor mode {}x{}".format(
+            args.width, args.height, args.framerate,
+            capture_width, capture_height,
+        )
+    )
+    camera = Camera(
+        width=args.width,
+        height=args.height,
+        framerate=args.framerate,
+        exposure_time_ns=exposure_ns,
+        gain_range=gain_range,
+        ae_lock=exposure_ms is not None,
+        capture_width=capture_width,
+        capture_height=capture_height,
+    )
+
+    focuser = Focuser(args.i2c_bus)
+    auto_focus = AutoFocus(
+        focuser,
+        camera,
+        roi=(0.4, 0.4, 0.2, 0.2),
+        focus_step=FOCUS_STEP,
+        move_settle_time=FOCUS_SETTLE_TIME,
+        decline_patience=5,
+        verbose=False,
+    )
+
+    model = YOLO(model_path)
+    device = inference_device
+    half = inference_device == "cuda"
+
+    warmup_ollama()
+    threading.Thread(target=ocr_worker, daemon=True, name="ollama-ocr-worker").start()
+
+    frame_id = 0
+    aspect_ratio_min = 0.0
+    aspect_ratio_max = 1.8
+
+    try:
+        while True:
+            try:
+                frame = camera.getFrame(timeout=2.0)
+            except Exception as error:
+                print("等待 IMX519 影像失敗:", error)
+                continue
+            if frame is None:
+                continue
+
+            frame_id += 1
+            frame = cv2.resize(frame, (args.width, args.height))
+            buses = detect_bus(frame)
+            current_ids = {bus[5] for bus in buses}
+
+            with lock:
+                for track_id in current_ids:
+                    if track_id in confirmed_buses:
+                        last_seen_frame[track_id] = frame_id
+
+            for x1, y1, x2, y2, confidence, track_id in buses:
+                width, height = x2 - x1, y2 - y1
+                if width <= 0 or height <= 0:
+                    continue
+
+                roi, (rx1, ry1, rx2, ry2) = extract_sign_roi(frame, x1, y1, x2, y2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 0, 255), 2)
+
+                with lock:
+                    confirmed_result = confirmed_buses.get(track_id)
+
+                if confirmed_result:
+                    cv2.putText(
+                        frame,
+                        f"BUS ID:{track_id} -> {confirmed_result}",
+                        (x1, max(25, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                    )
+                    continue
+
+                label = f"BUS ID:{track_id} [OCR]"
+                valid_roi = is_valid_roi(roi)
+                aspect_ratio = width / height
+                if not valid_roi:
+                    label = f"BUS ID:{track_id} [ROI TOO SMALL]"
+                elif not aspect_ratio_min <= aspect_ratio <= aspect_ratio_max:
+                    label = f"BUS ID:{track_id} [ANGLE FILTER]"
+                elif frame_id % OCR_FRAME_INTERVAL == 0:
+                    roi_height, roi_width = roi.shape[:2]
+                    if roi_width < TARGET_OCR_MIN_SIDE or roi_height < TARGET_OCR_MIN_SIDE:
+                        label = f"BUS ID:{track_id} [ROI UPSCALE]"
+                    schedule_ocr(track_id, roi, time.monotonic())
+
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1, max(25, y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255),
+                    2,
+                )
+
+            final_results = get_visible_results(frame_id)
+            display_text = ",".join(final_results) if final_results else "NONE"
+            color = (255, 0, 0) if final_results else (0, 165, 255)
+            cv2.putText(
+                frame,
+                f"BUS NUMBER: {display_text} | IMX519 {cam_state['framerate']} FPS",
+                (20, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                color,
+                2,
+            )
+            draw_control_overlay(frame, cam_state, focuser, auto_focus)
+            cv2.imshow("Bus Detection", frame)
+
+            key = cv2.waitKeyEx(10)
+            if key == -1:
+                continue
+            if key == 27 or (key & 0xFF) in (ord("q"), ord("Q")):
+                break
+            handle_camera_key(key, camera, cam_state, focuser, auto_focus, frame)
+    finally:
+        camera.close()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
+

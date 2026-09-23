@@ -153,17 +153,24 @@ class Camera(object):
     previewer = None
 
     def __init__(self, width=1280, height=720,
-                 framerate=15, exposure_time_ns=None, gain_range=None, ae_lock=False):
-        self.open_camera(width, height, framerate, exposure_time_ns, gain_range, ae_lock)
+                 framerate=15, exposure_time_ns=None, gain_range=None, ae_lock=False,
+                 capture_width=3840, capture_height=2160):
+        self.open_camera(width, height, framerate, exposure_time_ns, gain_range,
+                         ae_lock, capture_width, capture_height)
 
     def open_camera(self, width=1280, height=720,
-                     framerate=15, exposure_time_ns=None, gain_range=None, ae_lock=False):
+                    framerate=15, exposure_time_ns=None, gain_range=None, ae_lock=False,
+                    capture_width=3840, capture_height=2160):
         self._width = width
         self._height = height
         self._framerate = framerate
+        self._capture_width = capture_width
+        self._capture_height = capture_height
 
         self.cap = cv2.VideoCapture(
             gstreamer_pipeline(
+                capture_width=capture_width,
+                capture_height=capture_height,
                 flip_method=0,
                 display_width=width,
                 display_height=height,
@@ -176,9 +183,7 @@ class Camera(object):
         )
         if not self.cap.isOpened():
             raise RuntimeError("Failed to open camera!")
-        # Python thread 一旦被 stop() 就無法重新 start()，
-        # 所以只有在還沒建立過，或舊的執行緒已經停止時才建立新的 FrameReader
-        if self.frame_reader == None or not self.frame_reader.is_alive():
+        if self.frame_reader is None or not self.frame_reader.is_alive():
             self.frame_reader = FrameReader(self.cap, "")
             self.frame_reader.daemon = True
             self.frame_reader.start()
@@ -187,28 +192,25 @@ class Camera(object):
         self.previewer = Previewer(self.frame_reader, "")
 
     def reconfigure(self, framerate=None, exposure_time_ns=None,
-                     gain_range=None, ae_lock=False):
+                     gain_range=None, ae_lock=False,
+                     capture_width=None, capture_height=None):
         """
-        只重新建立底層的 cv2.VideoCapture 並換給正在跑的 FrameReader，
-        不會動到 FrameReader / Previewer 執行緒，也不會摧毀重建預覽視窗。
-        用來在不搶走終端機鍵盤焦點的情況下，動態調整曝光時間(快門速度)、增益等參數。
-
-        注意：nvarguscamerasrc 透過 Jetson 的 Argus daemon 運作，
-        同一顆相機同一時間只能有一個工作階段(session)，
-        所以必須先完全釋放舊的 cap，Argus 才會真正釋放相機資源，
-        否則開新管線時會卡住，甚至讓畫面定格。
+        重新建立底層 VideoCapture，可同時切換 FPS 與 IMX519 感測器擷取解析度。
         """
         framerate = framerate if framerate is not None else self._framerate
+        capture_width = capture_width if capture_width is not None else self._capture_width
+        capture_height = capture_height if capture_height is not None else self._capture_height
 
         old_cap = self.cap
         old_cap.release()
-        # 給 nvargus-daemon 一點時間真正釋放相機資源
         time.sleep(0.3)
 
         new_cap = None
         for _ in range(10):
             candidate = cv2.VideoCapture(
                 gstreamer_pipeline(
+                    capture_width=capture_width,
+                    capture_height=capture_height,
                     flip_method=0,
                     display_width=self._width,
                     display_height=self._height,
@@ -231,8 +233,10 @@ class Camera(object):
         self.frame_reader.set_camera(new_cap)
         self.cap = new_cap
         self._framerate = framerate
+        self._capture_width = capture_width
+        self._capture_height = capture_height
 
-    def getFrame(self, timeout = None):
+    def getFrame(self, timeout=None):
         return self.frame_reader.getFrame(timeout)
 
     def start_preview(self):
@@ -242,7 +246,7 @@ class Camera(object):
     def stop_preview(self):
         self.previewer.stop_preview()
         self.previewer.join()
-    
+
     def close(self):
         self.frame_reader.stop()
         self.cap.release()

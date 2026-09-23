@@ -33,6 +33,7 @@ from JetsonCamera import Camera
 
 from Focuser import Focuser
 from Autofocus import AutoFocus
+import curses
 
 global image_count
 image_count = 0
@@ -43,11 +44,6 @@ EXPOSURE_STEP_MS = 1.0
 EXPOSURE_MIN_MS = 0.1
 # 相對於 1/framerate 的安全係數，避免曝光時間超過單一畫格的時間
 EXPOSURE_MAX_RATIO = 0.95
-
-KEY_LEFT = (2424832, 65361, 81)
-KEY_UP = (2490368, 65362, 82)
-KEY_RIGHT = (2555904, 65363, 83)
-KEY_DOWN = (2621440, 65364, 84)
 
 
 def max_exposure_ms(framerate):
@@ -79,60 +75,88 @@ def reopen_camera_with_exposure(camera, cam_state, focuser=None):
         focuser.reinit()
 
 
-def is_key(key, *values):
-    return key in values or (key & 0xFF) in values
+# Rendering status bar
+def RenderStatusBar(stdscr):
+    height, width = stdscr.getmaxyx()
+    statusbarstr = "Press 'q' to exit"
+    stdscr.attron(curses.color_pair(3))
+    stdscr.addstr(height-1, 0, statusbarstr)
+    stdscr.addstr(height-1, len(statusbarstr), " " * (width - len(statusbarstr) - 1))
+    stdscr.attroff(curses.color_pair(3))
+# Rendering description
+def RenderDescription(stdscr):
+    focus_desc      = "Focus    : Up-Down Arrow"
+    autofocus_desc  = "AutoFocus: Enter Key"
+    shutter_desc    = "Shutter  : Left-Right Arrow (slower/faster), 'a' = Auto exposure"
+    snapshot_desc   = "Snapshot : 'c' Key"
 
+    desc_y = 1
+    
+    stdscr.addstr(desc_y + 1, 0, focus_desc, curses.color_pair(1))
+    stdscr.addstr(desc_y + 2, 0, autofocus_desc, curses.color_pair(1))
+    stdscr.addstr(desc_y + 3, 0, shutter_desc, curses.color_pair(1))
+    stdscr.addstr(desc_y + 4, 0, snapshot_desc, curses.color_pair(1))
+# Rendering  middle text
+def RenderMiddleText(stdscr,k,focuser,cam_state,auto_focus):
+    # get height and width of the window.
+    height, width = stdscr.getmaxyx()
+    # Declaration of strings
+    title = "Arducam Controller"[:width-1]
+    subtitle = ""[:width-1]
+    keystr = "Last key pressed: {}".format(k)[:width-1]
+    
+    
+    # Obtain device infomation
+    focus_value = "Focus    : {}".format(focuser.get(Focuser.OPT_FOCUS))[:width-1]
 
-def is_arrow_key(key):
-    return (
-        key in KEY_LEFT
-        or key in KEY_UP
-        or key in KEY_RIGHT
-        or key in KEY_DOWN
-    )
-
-
-def draw_text(frame, text, origin, color=(255, 255, 255), scale=0.65):
-    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
-                scale, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
-                scale, color, 2, cv2.LINE_AA)
-
-
-def draw_overlay(frame, key, focuser, cam_state, auto_focus):
-    focus_value = "Focus: {}".format(focuser.get(Focuser.OPT_FOCUS))
     if auto_focus.is_finished():
-        autofocus_value = "AutoFocus: Idle (best={})".format(auto_focus.best_position)
+        autofocus_value = "AutoFocus: Idle (best={})".format(auto_focus.best_position)[:width-1]
     else:
-        autofocus_value = "AutoFocus: Running"
+        autofocus_value = "AutoFocus: Running..."[:width-1]
 
     if cam_state['exposure_ms'] is not None:
         exposure_ms = cam_state['exposure_ms']
-        shutter_value = "Shutter: {:.2f} ms (~1/{:.0f}s)".format(
+        shutter_value = "Shutter  : {:.2f} ms (~1/{:.0f}s)".format(
             exposure_ms, 1000.0 / exposure_ms
-        )
+        )[:width-1]
     else:
-        shutter_value = "Shutter: Auto"
+        shutter_value = "Shutter  : Auto"[:width-1]
+    
+    if k == 0:
+        keystr = "No key press detected..."[:width-1]
 
-    key_text = "Last key: {}".format(key) if key >= 0 else "Last key: None"
-    lines = [
-        "Arducam Controller",
-        focus_value,
-        autofocus_value,
-        shutter_value,
-        key_text,
-        "Q/Esc exit | C snapshot | A auto exposure | Left/Right or [/] shutter",
-        "Up/Down or W/S focus | Enter/F autofocus | R reset focus",
-    ]
-    for index, line in enumerate(lines):
-        color = (0, 255, 255) if index == 0 else (255, 255, 255)
-        draw_text(frame, line, (20, 35 + index * 30), color=color)
+    # Centering calculations
+    start_x_title = int((width // 2) - (len(title) // 2) - len(title) % 2)
+    start_x_subtitle = int((width // 2) - (len(subtitle) // 2) - len(subtitle) % 2)
+    start_x_keystr = int((width // 2) - (len(keystr) // 2) - len(keystr) % 2)
+    start_x_device_info = int((width // 2) - (len("Focus    : 00000") // 2) - len("Focus    : 00000") % 2)
+    start_y = int((height // 2) - 6)
+    
+    # Turning on attributes for title
+    stdscr.attron(curses.color_pair(2))
+    stdscr.attron(curses.A_BOLD)
+
+    # Rendering title
+    stdscr.addstr(start_y, start_x_title, title)
+
+    # Turning off attributes for title
+    stdscr.attroff(curses.color_pair(2))
+    stdscr.attroff(curses.A_BOLD)
+
+    # Print rest of text
+    stdscr.addstr(start_y + 1, start_x_subtitle, subtitle)
+    stdscr.addstr(start_y + 3, (width // 2) - 2, '-' * 4)
+    stdscr.addstr(start_y + 5, start_x_keystr, keystr)
+    # Print device info
+    stdscr.addstr(start_y + 6, start_x_device_info, focus_value)
+    stdscr.addstr(start_y + 7, start_x_device_info, autofocus_value)
+    stdscr.addstr(start_y + 8, start_x_device_info, shutter_value)
 
 def parse_cmdline():
     parser = argparse.ArgumentParser(description='Arducam Controller.')
 
-    parser.add_argument('-i', '--i2c-bus', type=int, default=7,
-                        help='Set i2c bus. Default: 7')
+    parser.add_argument('-i', '--i2c-bus', type=int, nargs=None, required=True,
+                        help='Set i2c bus, for A02 is 6, for B01 is 7 or 8, for Jetson Xavier NX it is 9 and 10.')
     parser.add_argument('--width', type=int, default=1280,
                         help='Camera preview width. Default: 1280')
     parser.add_argument('--height', type=int, default=720,
@@ -154,67 +178,84 @@ def parseKey(k,focuser,auto_focus,camera,cam_state):
     global image_count
     focus_step  = 50
 
-    key8 = k & 0xFF
-
-    if k in KEY_RIGHT or key8 == ord(']'):
+    if k == ord('r'):
+        focuser.reset(Focuser.OPT_FOCUS)
+    elif k == curses.KEY_UP:
+        focuser.set(Focuser.OPT_FOCUS,focuser.get(Focuser.OPT_FOCUS) + focus_step)
+    elif k == curses.KEY_DOWN:
+        focuser.set(Focuser.OPT_FOCUS,focuser.get(Focuser.OPT_FOCUS) - focus_step)
+    elif k == 10:  # Enter
+        auto_focus.start_focus()
+    elif k == ord('c'):
+        #save image to file.
+        cv2.imwrite("image{}.jpg".format(image_count), camera.getFrame())
+        image_count += 1
+    elif k == curses.KEY_RIGHT:
         # 拉長曝光時間 -> 快門變慢，有助於拍到完整的LED看板數字
         current = cam_state['exposure_ms'] if cam_state['exposure_ms'] is not None else 0.0
         upper_bound = max_exposure_ms(cam_state['framerate'])
         cam_state['exposure_ms'] = min(current + EXPOSURE_STEP_MS, upper_bound)
         reopen_camera_with_exposure(camera, cam_state, focuser)
-    elif k in KEY_LEFT or key8 == ord('['):
+    elif k == curses.KEY_LEFT:
         # 縮短曝光時間 -> 快門變快
         if cam_state['exposure_ms'] is None:
             cam_state['exposure_ms'] = max_exposure_ms(cam_state['framerate'])
         cam_state['exposure_ms'] = max(cam_state['exposure_ms'] - EXPOSURE_STEP_MS, EXPOSURE_MIN_MS)
         reopen_camera_with_exposure(camera, cam_state, focuser)
-    elif k in KEY_UP or key8 in (ord('w'), ord('W')):
-        focuser.set(Focuser.OPT_FOCUS,focuser.get(Focuser.OPT_FOCUS) + focus_step)
-    elif k in KEY_DOWN or key8 in (ord('s'), ord('S')):
-        focuser.set(Focuser.OPT_FOCUS,focuser.get(Focuser.OPT_FOCUS) - focus_step)
-    elif key8 in (ord('r'), ord('R')):
-        focuser.reset(Focuser.OPT_FOCUS)
-    elif key8 in (10, 13) or k in (65421, ord('f'), ord('F')):  # Enter or F
-        auto_focus.start_focus()
-    elif key8 in (ord('c'), ord('C')):
-        #save image to file.
-        cv2.imwrite("image{}.jpg".format(image_count), camera.getFrame())
-        image_count += 1
-    elif key8 in (ord('a'), ord('A')):
+    elif k == ord('a'):
         # 切回自動曝光
         cam_state['exposure_ms'] = None
         reopen_camera_with_exposure(camera, cam_state, focuser)
 
 
-def draw_menu(camera, i2c_bus, cam_state):
+# Python curses example Written by Clay McLeod
+# https://gist.github.com/claymcleod/b670285f334acd56ad1c
+def draw_menu(stdscr, camera, i2c_bus, cam_state):
     focuser = Focuser(i2c_bus)
     auto_focus = AutoFocus(focuser, camera)
+    
 
-    window_name = "Arducam Controller"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, cam_state['width'], cam_state['height'])
-    last_key = -1
+    k = 0
+    cursor_x = 0
+    cursor_y = 0
 
-    while True:
-        try:
-            frame = camera.getFrame(timeout=1.0)
-        except Exception:
-            continue
-        if frame is None:
-            continue
+    # Clear and refresh the screen for a blank canvas
+    stdscr.clear()
+    stdscr.refresh()
 
-        draw_overlay(frame, last_key, focuser, cam_state, auto_focus)
-        cv2.imshow(window_name, frame)
+    # Start colors in curses
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+    curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)
 
-        key = cv2.waitKeyEx(10)
-        if key == -1:
-            continue
-        last_key = key
-        if key == 27 or ((key & 0xFF) in (ord('q'), ord('Q')) and not is_arrow_key(key)):
-            break
-        parseKey(key, focuser, auto_focus, camera, cam_state)
+    # Loop where k is the last character pressed
+    while (k != ord('q')):
+        # Initialization
+        stdscr.clear()
+        # Flush all input buffers. 
+        curses.flushinp()
+        # get height and width of the window.
+        height, width = stdscr.getmaxyx()
 
-    cv2.destroyWindow(window_name)
+        # parser input key
+        parseKey(k,focuser,auto_focus,camera,cam_state)
+
+        # Rendering some text
+        whstr = "Width: {}, Height: {}".format(width, height)
+        stdscr.addstr(0, 0, whstr, curses.color_pair(1))
+
+        # render key description
+        RenderDescription(stdscr)
+        # render status bar
+        RenderStatusBar(stdscr)
+        # render middle text
+        RenderMiddleText(stdscr,k,focuser,cam_state,auto_focus)
+        # Refresh the screen
+        stdscr.refresh()
+
+        # Wait for next input
+        k = stdscr.getch()
 
 def main():
     args = parse_cmdline()
@@ -241,11 +282,13 @@ def main():
         gain_range=gain_range,
         ae_lock=(args.exposure is not None),
     )
-    print("Using I2C bus:", args.i2c_bus)
-    try:
-        draw_menu(camera, args.i2c_bus, cam_state)
-    finally:
-        camera.close()
+    #open camera preview
+    camera.start_preview()
+    print(args.i2c_bus)
+    curses.wrapper(draw_menu, camera, args.i2c_bus, cam_state)
+
+    camera.stop_preview()
+    camera.close()
 
     
 

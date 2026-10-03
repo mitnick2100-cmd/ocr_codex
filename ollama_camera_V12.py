@@ -24,7 +24,7 @@ print("Device:", device)
 
 model = YOLO("yolov8n.pt")
 half = device == "cuda"
-VIDEO_PATH = "C:/Users/Mitnick/Desktop/FCU/VS_Code/ocr_codex/bus_image/bus_5.mp4"
+VIDEO_PATH = "C:/Users/Mitnick/Desktop/FCU/VS_Code/ocr_codex/bus_image/bus_14.mp4"
 
 # =========================
 # 執行參數
@@ -321,7 +321,7 @@ def detect_bus(frame):
         imgsz=(768, 1280),
         device=device,
         classes=[5],
-        conf=0.5,
+        conf=0.2,
         half=half,
         persist=True,
         verbose=False,

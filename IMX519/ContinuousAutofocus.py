@@ -62,7 +62,10 @@ class FocusController:
         self.started = now
         self.move_count = 0
         self.attempts += 1
-        self.full = self.reference is None
+        # Turbo deliberately stays local, including on its first run. This is
+        # quick when the current lens position is near the target, but cannot
+        # recover reliably from an arbitrary starting position.
+        self.full = self.reference is None and not self.turbo
         self.reason = "Automatic scan #{}".format(self.attempts)
         if self.turbo and not self.full:
             self.scan([self.origin, max(0, self.origin - 40),
@@ -133,7 +136,7 @@ class FocusController:
                 improved = self.reference is None or value > self.before * 1.08
                 if self.turbo and not self.full and not (
                         value >= self.args.min_sharpness and value >= self.peak * 0.8 and improved):
-                    self.full_scan(now)
+                    self.finish(now, False, value)
                     return
                 self.finish(now, value >= self.args.min_sharpness and
                             value >= self.peak * 0.8 and improved, value)
@@ -147,7 +150,7 @@ class FocusController:
                     nxt = self.position + self.direction * 40
                     if 0 <= nxt <= 1000:
                         if self.walk_steps >= 4:
-                            self.full_scan(now)
+                            self.refine(self.walk_best, [10], now, radius=50)
                             return
                         self.go(nxt, now)
                         return
@@ -161,7 +164,7 @@ class FocusController:
             peak = self.results[best]
             if self.state == "PROBE":
                 if peak < max(self.args.min_sharpness, self.before * 1.08):
-                    self.full_scan(now)
+                    self.finish(now, False, peak)
                 elif best == self.origin:
                     self.refine(best, [10], now, radius=50)
                 else:

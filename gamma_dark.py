@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """公車 LED 看板影像增強工具。
 
-此工具採用與 ``ollama_camera_V11.py`` 相同的影像增強策略：
+此工具保留 gamma、CLAHE 與低強度銳化：
 
 1. 僅處理 LAB 色彩空間的 L（亮度）通道，避免改變 LED 顏色。
-2. 依過曝、偏暗與低對比狀態，選擇高光壓縮、CLAHE 或維持原圖。
+2. 依過曝、偏暗與低對比狀態，選擇 gamma 校正或 CLAHE。
 3. gamma > 1 變暗，gamma < 1 變亮；與公式及命令列參數方向一致。
-4. 雙邊去噪與高斯濾波後才進行低強度銳化，避免放大夜間影片雜訊。
+4. 不使用雙邊去噪、高光壓縮或獨立高斯平滑。Unsharp 內部的高斯
+   模糊只用來計算銳化差值。
 """
 
 import argparse
@@ -31,17 +32,6 @@ def apply_gamma(image: np.ndarray, gamma: float) -> np.ndarray:
     return cv2.LUT(image, build_gamma_lut(gamma))
 
 
-def highlight_rolloff(luma: np.ndarray, knee: float = 0.80,
-                      strength: float = 0.65) -> np.ndarray:
-    """壓縮高於 knee 的亮度，盡量保留 LED 高光邊緣細節。"""
-    image_f = luma.astype(np.float32) / 255.0
-    compressed = image_f.copy()
-    mask = image_f > knee
-    over = (image_f - knee) / (1.0 - knee + 1e-6)
-    compressed[mask] = knee + (1.0 - knee) * (over[mask] ** (1.0 + strength))
-    return np.clip(compressed * 255.0, 0, 255).astype(np.uint8)
-
-
 def overexposed_ratio(image: np.ndarray, threshold: int = 250) -> float:
     """回傳近乎死白的亮度像素比例。"""
     luma = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
@@ -60,16 +50,9 @@ def auto_gamma(image: np.ndarray, target_mean: float = 128.0,
 
 def unsharp_mask(image: np.ndarray, sigma: float = 0.8,
                  strength: float = 0.65) -> np.ndarray:
-    """低強度銳化；適合放在去噪與對比校正之後。"""
+    """低強度銳化；內部模糊是銳化參考，不是獨立平滑步驟。"""
     blurred = cv2.GaussianBlur(image, (0, 0), sigma)
     return cv2.addWeighted(image, 1 + strength, blurred, -strength, 0)
-
-
-def gaussian_filter(image: np.ndarray, sigma: float = 0.7) -> np.ndarray:
-    """高斯濾波；sigma <= 0 時維持原圖。"""
-    if sigma <= 0:
-        return image
-    return cv2.GaussianBlur(image, (0, 0), sigma)
 
 
 def merge_luma(luma: np.ndarray, channel_a: np.ndarray,
@@ -80,36 +63,23 @@ def merge_luma(luma: np.ndarray, channel_a: np.ndarray,
 
 
 def fix_overexposure(image: np.ndarray, gamma: float | None = None,
-                      use_highlight_rolloff: bool = True,
-                      use_gaussian: bool = True,
-                      gaussian_sigma: float = 0.7,
                       target_mean: float = 120.0) -> np.ndarray:
-    """相容舊版 API 的過曝修正函式。
+    """只在亮度通道進行 gamma 校正。
 
-    只在亮度通道進行雙邊去噪、高光壓縮與 gamma 校正；未指定 gamma
-    時會自動估算，使結果趨近 target_mean。
+    未指定 gamma 時會自動估算，使結果趨近 target_mean。
     """
     if image is None or image.size == 0:
         raise ValueError("影像不可為空")
 
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     luma, channel_a, channel_b = cv2.split(lab)
-    luma = cv2.bilateralFilter(luma, d=5, sigmaColor=25, sigmaSpace=5)
-    if use_gaussian:
-        luma = gaussian_filter(luma, sigma=gaussian_sigma)
-
-    if use_highlight_rolloff:
-        luma = highlight_rolloff(luma)
     if gamma is None:
         gamma = auto_gamma(luma, target_mean=target_mean)
     return merge_luma(apply_gamma(luma, gamma), channel_a, channel_b)
 
 
 def enhance_image(image: np.ndarray, gamma: float | None = None,
-                  use_highlight_rolloff: bool = True,
                   use_clahe: bool = True,
-                  use_gaussian: bool = True,
-                  gaussian_sigma: float = 0.7,
                   use_sharpen: bool = True,
                   target_mean: float = 128.0) -> tuple[np.ndarray, dict]:
     """依影像狀態選擇合適的 LED 看板增強策略。
@@ -123,10 +93,6 @@ def enhance_image(image: np.ndarray, gamma: float | None = None,
 
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     luma, channel_a, channel_b = cv2.split(lab)
-    luma = cv2.bilateralFilter(luma, d=5, sigmaColor=25, sigmaSpace=5)
-    if use_gaussian:
-        luma = gaussian_filter(luma, sigma=gaussian_sigma)
-
     mean_luma = float(luma.mean())
     contrast = float(luma.std())
     white_ratio = overexposed_ratio(luma)
@@ -135,13 +101,9 @@ def enhance_image(image: np.ndarray, gamma: float | None = None,
 
     if gamma is not None:
         strategy = "manual-gamma"
-        if use_highlight_rolloff:
-            luma = highlight_rolloff(luma)
         luma = apply_gamma(luma, gamma)
     elif white_ratio >= 0.08 or mean_luma >= 165:
         strategy = "overexposed"
-        if use_highlight_rolloff:
-            luma = highlight_rolloff(luma)
         applied_gamma = auto_gamma(
             luma,
             target_mean=min(target_mean, 120.0),
@@ -178,8 +140,7 @@ def enhance_image(image: np.ndarray, gamma: float | None = None,
         "overexposed_ratio": white_ratio,
         "gamma": applied_gamma,
         "clahe": clahe_used,
-        "gaussian": use_gaussian,
-        "gaussian_sigma": gaussian_sigma if use_gaussian else None,
+        "sharpen": use_sharpen,
     }
     return merge_luma(luma, channel_a, channel_b), metadata
 
@@ -196,11 +157,7 @@ def main():
     )
     parser.add_argument("--target-mean", type=float, default=128.0,
                         help="自動 gamma 的目標平均亮度（預設 128）")
-    parser.add_argument("--no-rolloff", action="store_true", help="關閉高光壓縮")
     parser.add_argument("--no-clahe", action="store_true", help="關閉局部對比增強")
-    parser.add_argument("--no-gaussian", action="store_true", help="關閉高斯濾波")
-    parser.add_argument("--gaussian-sigma", type=float, default=0.7,
-                        help="高斯濾波 sigma；值越大越平滑（預設 0.7）")
     parser.add_argument("--no-sharpen", action="store_true", help="關閉最後的輕度銳化")
     args = parser.parse_args()
 
@@ -216,10 +173,7 @@ def main():
     result, metadata = enhance_image(
         image,
         gamma=args.gamma,
-        use_highlight_rolloff=not args.no_rolloff,
         use_clahe=not args.no_clahe,
-        use_gaussian=not args.no_gaussian,
-        gaussian_sigma=args.gaussian_sigma,
         use_sharpen=not args.no_sharpen,
         target_mean=args.target_mean,
     )
@@ -231,7 +185,7 @@ def main():
         f"策略: {metadata['strategy']} | 平均亮度: {metadata['mean_luma']:.1f} | "
         f"對比: {metadata['contrast']:.1f} | 死白比例: {metadata['overexposed_ratio']:.1%} | "
         f"gamma: {metadata['gamma']} | CLAHE: {metadata['clahe']} | "
-        f"Gaussian: {metadata['gaussian_sigma']}"
+        f"Sharpen: {metadata['sharpen']}"
     )
 
 

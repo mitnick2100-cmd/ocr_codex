@@ -24,7 +24,7 @@ print("Device:", device)
 
 model = YOLO("yolov8n.pt")
 half = device == "cuda"
-VIDEO_PATH = "C:/Users/Mitnick/Desktop/FCU/VS_Code/ocr_codex/bus_image/bus_24.mp4"
+VIDEO_PATH = "C:/Users/Mitnick/Desktop/FCU/VS_Code/ocr_codex/bus_image/bus_5.mp4"
 
 # =========================
 # 執行參數
@@ -68,7 +68,8 @@ def encode_frame(frame):
 def warmup_ollama():
     """預載入模型並保持在 VRAM，減少第一個 OCR 任務的等待時間。"""
     print("Ollama warming up...")
-    dummy = upscale_for_ocr(np.zeros((10, 10, 3), dtype=np.uint8))
+    # 暖機只走小尺寸全黑圖片，不使用 OCR 放大或影像增強。
+    dummy = np.zeros((OLLAMA_MIN_IMAGE_SIDE, OLLAMA_MIN_IMAGE_SIDE, 3), dtype=np.uint8)
     payload = {
         "model": MODEL_NAME,
         "messages": [
@@ -77,6 +78,7 @@ def warmup_ollama():
         ],
         "stream": False,
         "keep_alive": -1,
+        "options": {"num_predict": 1, "temperature": 0},
     }
 
     try:
@@ -106,17 +108,6 @@ def apply_gamma(image: np.ndarray, gamma: float) -> np.ndarray:
     return cv2.LUT(image, build_gamma_lut(gamma))
 
 
-def highlight_rolloff(luma: np.ndarray, knee: float = 0.80,
-                      strength: float = 0.65) -> np.ndarray:
-    """只壓縮高於 knee 的亮度，盡量保留 LED 高光邊緣。"""
-    image_f = luma.astype(np.float32) / 255.0
-    compressed = image_f.copy()
-    mask = image_f > knee
-    over = (image_f - knee) / (1.0 - knee + 1e-6)
-    compressed[mask] = knee + (1.0 - knee) * (over[mask] ** (1.0 + strength))
-    return np.clip(compressed * 255.0, 0, 255).astype(np.uint8)
-
-
 def overexposed_ratio(image: np.ndarray, threshold: int = 250) -> float:
     """計算近乎死白的亮度像素比例。"""
     luma = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
@@ -134,7 +125,7 @@ def auto_gamma(image: np.ndarray, target_mean: float = 128.0) -> float:
 
 def unsharp_mask(image: np.ndarray, sigma: float = 0.8,
                  strength: float = 0.65) -> np.ndarray:
-    """低強度銳化；應在去噪與對比調整後使用。"""
+    """低強度銳化；內部高斯模糊只用來計算銳化差值。"""
     blurred = cv2.GaussianBlur(image, (0, 0), sigma)
     return cv2.addWeighted(image, 1 + strength, blurred, -strength, 0)
 
@@ -142,8 +133,8 @@ def unsharp_mask(image: np.ndarray, sigma: float = 0.8,
 def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
     """針對 LED 看板做條件式增強，不改變 BGR 色彩通道。
 
-    流程：LAB-L 亮度通道去噪 -> 依曝光狀態做高光壓縮或 CLAHE ->
-    必要時 gamma 校正 -> 輕度銳化。正常曝光且對比足夠的影像不會被強制
+    流程：依 LAB-L 曝光狀態選擇 gamma 校正或 CLAHE -> 輕度銳化。
+    不使用雙邊濾波或高光壓縮。正常曝光且對比足夠的影像不會被強制
     套用 gamma，避免損失數字與背景之間的細節。
     """
     if roi_img is None or roi_img.size == 0:
@@ -152,8 +143,6 @@ def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
     luma, channel_a, channel_b = cv2.split(lab)
 
-    # 先處理壓縮雜訊，避免銳化把夜間影片雜點放大。
-    luma = cv2.bilateralFilter(luma, d=5, sigmaColor=25, sigmaSpace=5)
     mean_luma = float(luma.mean())
     contrast = float(luma.std())
     white_ratio = overexposed_ratio(luma)
@@ -162,7 +151,6 @@ def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
 
     if white_ratio >= 0.08 or mean_luma >= 165:
         strategy = "overexposed"
-        luma = highlight_rolloff(luma)
         gamma_used = auto_gamma(luma, target_mean=120.0)
         luma = apply_gamma(luma, gamma_used)
     elif mean_luma <= 115:
@@ -399,8 +387,8 @@ def main():
             break
 
         frame_id += 1
-        ##frame = cv2.resize(frame, (720, 1280))
-        frame = cv2.resize(frame, (1280, 720))
+        frame = cv2.resize(frame, (720, 1280))
+        ##frame = cv2.resize(frame, (1280, 720))
         buses = detect_bus(frame)
         current_ids = {bus[5] for bus in buses}
 

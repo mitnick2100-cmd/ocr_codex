@@ -131,11 +131,11 @@ def unsharp_mask(image: np.ndarray, sigma: float = 0.8,
 
 
 def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
-    """針對 LED 看板做條件式增強，不改變 BGR 色彩通道。
+    """在 LAB 的 L 通道依序執行 CLAHE、Gamma 與輕度銳化。
 
-    流程：依 LAB-L 曝光狀態選擇 gamma 校正或 CLAHE -> 輕度銳化。
-    不使用雙邊濾波或高光壓縮。正常曝光且對比足夠的影像不會被強制
-    套用 gamma，避免損失數字與背景之間的細節。
+    Gamma 係數由原始 L 通道估算，目標均值 128、範圍 0.55 至 2.5；
+    估算後先執行 CLAHE，再套用 Gamma。a、b 通道保留供色彩重建。
+    不使用雙邊濾波、高光壓縮或獨立高斯平滑。
     """
     if roi_img is None or roi_img.size == 0:
         raise ValueError("ROI 不可為空")
@@ -146,35 +146,16 @@ def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
     mean_luma = float(luma.mean())
     contrast = float(luma.std())
     white_ratio = overexposed_ratio(luma)
-    clahe_used = False
-    gamma_used = None
-
-    if white_ratio >= 0.08 or mean_luma >= 165:
-        strategy = "overexposed"
-        gamma_used = auto_gamma(luma, target_mean=120.0)
-        luma = apply_gamma(luma, gamma_used)
-    elif mean_luma <= 115:
-        strategy = "dark"
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        luma = clahe.apply(luma)
-        gamma_used = auto_gamma(luma, target_mean=142.0)
-        luma = apply_gamma(luma, gamma_used)
-        clahe_used = True
-    elif contrast <= 35:
-        strategy = "low-contrast"
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-        luma = clahe.apply(luma)
-        clahe_used = True
-    else:
-        strategy = "normal"
-
+    gamma_used = auto_gamma(luma, target_mean=128.0)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    luma = clahe.apply(luma)
+    luma = apply_gamma(luma, gamma_used)
     luma = unsharp_mask(luma)
     enhanced = cv2.cvtColor(cv2.merge((luma, channel_a, channel_b)), cv2.COLOR_LAB2BGR)
-    gamma_text = f"{gamma_used:.2f}" if gamma_used is not None else "None"
     print(
-        f"[enhance_roi] {strategy}, mean={mean_luma:.1f}, "
+        f"[enhance_roi] clahe-gamma, mean={mean_luma:.1f}, "
         f"contrast={contrast:.1f}, white={white_ratio:.1%}, "
-        f"gamma={gamma_text}, CLAHE={clahe_used}"
+        f"gamma={gamma_used:.2f}, CLAHE=True, target=128"
     )
     return enhanced
 

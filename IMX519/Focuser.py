@@ -26,13 +26,54 @@ import sys
 import time
 import os
 
+# 優先用 smbus2 直接寫 I2C（每次約 <1ms）；原本每次寫入要開兩個 i2cset 外部程式，
+# 一次移動約多花數十 ms。沒裝 smbus2 或寫入失敗時，自動退回原本的 i2cset 指令，
+# 行為與原版相同。安裝：pip3 install smbus2
+try:
+    from smbus2 import SMBus
+except ImportError:
+    SMBus = None
+    print("[Focuser] smbus2 not installed; falling back to i2cset (slower). "
+          "Install with: pip3 install smbus2", file=sys.stderr)
+
+_buses = {}
+
+def _get_bus(bus):
+    if SMBus is None:
+        return None
+    handle = _buses.get(bus)
+    if handle is None:
+        try:
+            handle = SMBus(bus)
+        except (OSError, IOError) as e:
+            print("[Focuser] cannot open /dev/i2c-{} ({}); using i2cset".format(bus, e),
+                  file=sys.stderr)
+            return None
+        _buses[bus] = handle
+    return handle
+
+def _write_reg(bus, address, reg, value):
+    handle = _get_bus(bus)
+    if handle is not None:
+        try:
+            handle.write_byte_data(address, reg, value)
+            return
+        except (OSError, IOError):
+            # 相機重建時對焦晶片可能被斷電；關掉舊 handle，這次改用 i2cset，下次重新開啟
+            try:
+                handle.close()
+            except Exception:
+                pass
+            _buses.pop(bus, None)
+    os.system("i2cset -y {} 0x{:02x} 0x{:02x} 0x{:02x}".format(bus, address, reg, value))
+
 def init(bus, address):
-    os.system("i2cset -y {} 0x{:02x} 0x02 0x00".format(bus, address))
+    _write_reg(bus, address, 0x02, 0x00)
 
 def write(bus, address, value):
     value <<= 4
-    os.system("i2cset -y {} 0x{:02x} 0x00 0x{:02x}".format(bus, address, value >> 8))
-    os.system("i2cset -y {} 0x{:02x} 0x01 0x{:02x}".format(bus, address, value & 0xFF))
+    _write_reg(bus, address, 0x00, value >> 8)
+    _write_reg(bus, address, 0x01, value & 0xFF)
 
 class Focuser:
     bus = None

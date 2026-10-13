@@ -1,14 +1,58 @@
 #!/usr/bin/env python3
-"""IMX519 / Jetson automatic refocus experiment; no focus key required.
+"""IMX519 / Jetson continuous autofocus (turbo-only, no fine scan).
 
 Run beside JetsonCamera.py and Focuser.py. Fixed central ROI, not object
 tracking. Motion gating is a heuristic, not a motion/defocus classifier.
+
+Trigger: the smoothed ROI score drops below reference x drop-ratio, or rises
+(a new textured target appears: score reaches min-sharpness while the
+reference is below it, or exceeds reference x rise-ratio).
+
+Turbo search:  PROBE (origin, +/-STEP) -> WALK toward the better side until
+the score stops improving -> interpolate the peak from the best point and its
+two measured neighbours (no extra moves) -> VERIFY.  If the very first lock
+fails (lens starts far from focus), one coarse RESCUE sweep is run instead.
 """
 import argparse
 from collections import deque
+import math
 from queue import Empty
 from statistics import median
 import time
+
+FOCUS_MIN, FOCUS_MAX = 0, 1000
+STEP = 40                # PROBE offset and WALK increment
+WALK_GAIN = 1.03         # keep walking while score improves by > 3 %
+IMPROVE_RATIO = 1.08     # a new position must beat the trigger score by 8 %
+VERIFY_KEEP = 0.8        # verified score must keep 80 % of the best measured score
+RESCUE_STEP = 100        # bootstrap sweep step (first lock only)
+GUARD_FRAMES = 2
+SAMPLES = 2
+VERIFY_SAMPLES = 3
+SCAN_TIMEOUT = 60.0
+MAX_FAILS = 3            # consecutive failures before re-baselining
+
+
+def clamp(p):
+    return max(FOCUS_MIN, min(FOCUS_MAX, int(round(p))))
+
+
+def interpolate_peak(results, best, step):
+    """Gaussian (log-parabola) fit through best and its +/-step neighbours.
+
+    Uses scores already measured, so it costs no lens movement. Falls back
+    to `best` when a neighbour is missing or the curve is not a peak.
+    """
+    left, right = results.get(best - step), results.get(best + step)
+    centre = results[best]
+    if left is None or right is None or min(left, centre, right) <= 0:
+        return best
+    l, c, r = math.log(left), math.log(centre), math.log(right)
+    denom = l - 2 * c + r
+    if denom >= 0:
+        return best
+    offset = 0.5 * step * (l - r) / denom
+    return clamp(best + max(-step / 2, min(step / 2, offset)))
 
 
 class FocusController:
@@ -18,12 +62,6 @@ class FocusController:
         self.move = move
         self.position = position
         self.args = args
-        self.turbo = getattr(args, "af_speed", "fast") == "turbo"
-        self.fast = getattr(args, "af_speed", "fast") != "safe"
-        self.guard_frames = 2 if self.fast else 3
-        self.sample_count = 2 if self.fast else 3
-        self.coarse_step = 50 if self.turbo or not self.fast else 100
-        self.local_radius = 100 if self.fast else 150
         self.last_duration = None
         self.move_count = 0
         self.reference = None
@@ -34,27 +72,45 @@ class FocusController:
         self.history = deque(maxlen=5)
         self.samples = []
         self.results = {}
+        self.pending = iter(())
         self.active = False
         self.attempts = 0
+        self.fails = 0
+        self.rescued = False
+        self.origin = position
+        self.before = 0.0
+        self.started = 0.0
+        self.peak = 0.0
+        self.direction = 1
+        self.walk_best = position
+        self.walk_peak = 0.0
         self.reason = "Waiting for camera"
 
+    # ---- motor / scan helpers -------------------------------------------
     def go(self, position, now):
-        self.position = max(0, min(1000, int(position)))
+        self.position = clamp(position)
         command_started = time.monotonic()
         self.move(self.position)
         command_duration = time.monotonic() - command_started
         self.move_count += 1
         # Wait after I2C completion. Arrival timing is not an exposure timestamp.
         self.ready_at = now + command_duration + max(
-            self.args.settle, self.guard_frames / self.args.framerate)
+            self.args.settle, GUARD_FRAMES / self.args.framerate)
         self.samples = []
 
     def scan(self, points, state, now):
-        self.pending = iter(sorted(set(points)))
+        self.pending = iter(sorted({clamp(p) for p in points}))
         self.results = {}
         self.state = state
         self.go(next(self.pending), now)
 
+    def lock(self, best, step, now):
+        """Jump straight to the interpolated peak and verify it."""
+        self.peak = self.results[best]
+        self.state = "VERIFY"
+        self.go(interpolate_peak(self.results, best, step), now)
+
+    # ---- lifecycle ------------------------------------------------------
     def start(self, now, score):
         self.active = True
         self.origin = self.position
@@ -62,57 +118,45 @@ class FocusController:
         self.started = now
         self.move_count = 0
         self.attempts += 1
-        # Turbo deliberately stays local, including on its first run. This is
-        # quick when the current lens position is near the target, but cannot
-        # recover reliably from an arbitrary starting position.
-        self.full = self.reference is None and not self.turbo
         self.reason = "Automatic scan #{}".format(self.attempts)
-        if self.turbo and not self.full:
-            self.scan([self.origin, max(0, self.origin - 40),
-                       min(1000, self.origin + 40)], "PROBE", now)
-            print(self.reason, flush=True)
-            return
-        if self.full:
-            self.search_step = self.coarse_step
-            points = range(0, 1001, self.search_step)
-        else:
-            self.search_step = 50
-            lo = max(0, self.origin - self.local_radius)
-            hi = min(1000, self.origin + self.local_radius)
-            points = list(range(lo, hi + 1, 50)) + [hi, self.origin]
-        self.scan(points, "COARSE", now)
+        self.scan([self.origin - STEP, self.origin, self.origin + STEP], "PROBE", now)
         print(self.reason, flush=True)
 
-    def full_scan(self, now):
-        self.full = True
-        self.search_step = self.coarse_step
-        self.scan(range(0, 1001, self.search_step), "COARSE", now)
+    def rescue(self, now):
+        """Bootstrap only: lens may start far from focus, where PROBE is blind."""
+        self.rescued = True
+        self.reason = "Rescue sweep (first lock)"
+        self.scan(range(FOCUS_MIN, FOCUS_MAX + 1, RESCUE_STEP), "RESCUE", now)
+        print(self.reason, flush=True)
 
-    def refine(self, best, steps, now, radius=None):
-        self.refine_steps = list(steps)
-        step = self.refine_steps.pop(0)
-        radius = step if radius is None else radius
-        points = list(range(max(0, best - radius), min(1000, best + radius) + 1, step))
-        self.scan(points + [best], "REFINE", now)
-
-    def finish(self, now, success, score=0):
+    def finish(self, now, success, score=0.0):
         self.last_duration = now - self.started
         if success:
             self.reference = score
+            self.fails = 0
             self.reason = "Focus verified"
         else:
             self.go(self.origin, now)
+            self.fails += 1
             self.reason = "No reliable improvement; restored previous position"
+            # Scene changed but origin is already the best we can find:
+            # accept the current level as the new baseline instead of
+            # re-triggering forever.
+            if self.reference is not None and self.fails >= MAX_FAILS:
+                self.reference = self.before
+                self.fails = 0
+                self.reason += " (re-baselined)"
         self.active = False
         self.state = "COOLDOWN"
-        self.ready_at = now + (self.args.cooldown if success else max(5, self.args.cooldown))
+        self.ready_at = now + self.args.cooldown
         self.stable_since = self.low_since = None
         self.history.clear()
         print("{}: position={}, score={:.1f}, elapsed={:.2f}s, moves={}".format(
             self.reason, self.position, score, self.last_duration, self.move_count), flush=True)
 
+    # ---- per-frame update -----------------------------------------------
     def update(self, now, score, motion, valid):
-        if self.active and now - self.started > 60:
+        if self.active and now - self.started > SCAN_TIMEOUT:
             self.finish(now, False)
             return
         if now < self.ready_at:
@@ -126,101 +170,94 @@ class FocusController:
                 self.reason = "Motion / dark / saturated; waiting"
             return
         if self.active:
-            self.samples.append(score)
-            required = 3 if self.state == "VERIFY" else self.sample_count
-            if len(self.samples) < required:
-                return
-            value = median(self.samples)
-            if self.state == "VERIFY":
-                # Flat scenes must not be declared a successful focus lock.
-                improved = self.reference is None or value > self.before * 1.08
-                if self.turbo and not self.full and not (
-                        value >= self.args.min_sharpness and value >= self.peak * 0.8 and improved):
-                    self.finish(now, False, value)
-                    return
-                self.finish(now, value >= self.args.min_sharpness and
-                            value >= self.peak * 0.8 and improved, value)
-                return
-            self.results[self.position] = value
-            if self.state == "WALK":
-                # Walk in 40-unit increments until improvement stops; no full sweep.
-                self.walk_steps += 1
-                if value > self.walk_peak * 1.03:
-                    self.walk_best, self.walk_peak = self.position, value
-                    nxt = self.position + self.direction * 40
-                    if 0 <= nxt <= 1000:
-                        if self.walk_steps >= 4:
-                            self.refine(self.walk_best, [10], now, radius=50)
-                            return
-                        self.go(nxt, now)
-                        return
-                self.refine(self.walk_best, [20, 10], now)
-                return
-            nxt = next(self.pending, None)
-            if nxt is not None:
-                self.go(nxt, now)
-                return
-            best = max(self.results, key=self.results.get)
-            peak = self.results[best]
-            if self.state == "PROBE":
-                if peak < max(self.args.min_sharpness, self.before * 1.08):
-                    self.finish(now, False, peak)
-                elif best == self.origin:
-                    self.refine(best, [10], now, radius=50)
-                else:
-                    self.direction = 1 if best > self.origin else -1
-                    self.walk_steps = 0
-                    self.walk_best, self.walk_peak = best, peak
-                    nxt = best + self.direction * 40
-                    if 0 <= nxt <= 1000:
-                        self.state = "WALK"
-                        self.go(nxt, now)
-                    else:
-                        self.refine(best, [10], now, radius=50)
-                return
-            if self.state == "REFINE":
-                if self.refine_steps:
-                    self.refine(best, self.refine_steps, now)
-                else:
-                    self.peak = peak
-                    self.state = "VERIFY"
-                    self.go(best, now)
-                return
-            if self.state == "COARSE":
-                if self.full and peak < max(self.args.min_sharpness,
-                                            min(self.results.values()) * 1.1):
-                    self.finish(now, False)
-                    return
-                boundary = best in (min(self.results), max(self.results))
-                if not self.full and (boundary or peak < self.before * 1.08):
-                    self.full_scan(now)
-                elif self.turbo:
-                    self.refine(best, [10], now, radius=50)
-                else:
-                    step = 25 if self.fast else 10
-                    self.scan(range(max(0, best - self.search_step),
-                                    min(1000, best + self.search_step) + 1, step),
-                              "FINE", now)
-            elif self.state == "FINE" and self.fast:
-                # Keep the measured best candidate, including near travel limits.
-                points = list(range(max(0, best - 20), min(1000, best + 20) + 1, 10))
-                self.scan(points + [best], "POLISH", now)
-            else:
-                self.peak = peak
-                self.state = "VERIFY"
-                self.go(best, now)
+            self._step(now, score)
+        else:
+            self._monitor(now, score)
+
+    def _step(self, now, score):
+        self.samples.append(score)
+        required = VERIFY_SAMPLES if self.state == "VERIFY" else SAMPLES
+        if len(self.samples) < required:
             return
+        value = median(self.samples)
+
+        if self.state == "VERIFY":
+            # Flat scenes must not be declared a successful focus lock.
+            improved = self.reference is None or value > self.before * IMPROVE_RATIO
+            self.finish(now, value >= self.args.min_sharpness and
+                        value >= self.peak * VERIFY_KEEP and improved, value)
+            return
+
+        self.results[self.position] = value
+
+        if self.state == "WALK":
+            if value > self.walk_peak * WALK_GAIN:
+                self.walk_best, self.walk_peak = self.position, value
+                nxt = self.position + self.direction * STEP
+                if FOCUS_MIN <= nxt <= FOCUS_MAX:
+                    self.go(nxt, now)
+                    return
+            # Passed the peak (or hit the travel limit): it lies near walk_best.
+            self.lock(self.walk_best, STEP, now)
+            return
+
+        nxt = next(self.pending, None)
+        if nxt is not None:
+            self.go(nxt, now)
+            return
+        best = max(self.results, key=self.results.get)
+        peak = self.results[best]
+
+        if self.state == "PROBE":
+            # First lock: any usable sharpness is enough (nothing to beat yet).
+            need = self.args.min_sharpness if self.reference is None else \
+                max(self.args.min_sharpness, self.before * IMPROVE_RATIO)
+            if peak < need:
+                if self.reference is None and not self.rescued:
+                    self.rescue(now)
+                else:
+                    self.finish(now, False, peak)
+            elif best == self.origin:
+                self.lock(best, STEP, now)
+            else:
+                self.direction = 1 if best > self.origin else -1
+                self.walk_best, self.walk_peak = best, peak
+                nxt = best + self.direction * STEP
+                if FOCUS_MIN <= nxt <= FOCUS_MAX:
+                    self.state = "WALK"
+                    self.go(nxt, now)
+                else:
+                    self.lock(best, STEP, now)
+            return
+
+        if self.state == "RESCUE":
+            if peak < max(self.args.min_sharpness, min(self.results.values()) * 1.1):
+                self.finish(now, False, peak)
+            else:
+                self.lock(best, RESCUE_STEP, now)
+
+    def _monitor(self, now, score):
         self.state = "MONITOR"
         self.reason = "Monitoring central ROI"
         if self.stable_since is None:
             self.stable_since = now
         self.history.append(score)
-        if len(self.history) < 5 or now - self.stable_since < 0.5:
+        if len(self.history) < self.history.maxlen or now - self.stable_since < 0.5:
             return
         smoothed = median(self.history)
-        if self.reference is None:
+        ref = self.reference
+        if ref is None:
             self.start(now, smoothed)
-        elif smoothed < self.reference * self.args.drop_ratio:
+            return
+        if ref < self.args.min_sharpness:
+            self.reason = "No target texture in ROI; waiting for a new target"
+        # Drop: the locked target went out of focus.
+        drop = smoothed < ref * self.args.drop_ratio
+        # Rise: a new textured target appeared. Without this, a low reference
+        # (e.g. re-baselined on a blank wall) would never trigger again.
+        rise = ((ref < self.args.min_sharpness <= smoothed) or
+                smoothed > ref * getattr(self.args, "rise_ratio", 2.0))
+        if drop or rise:
             if self.low_since is None:
                 self.low_since = now
             elif now - self.low_since >= self.args.trigger_delay:
@@ -241,22 +278,22 @@ def main():
     parser.add_argument("--exposure", type=float, default=None, help="Fixed exposure in ms")
     parser.add_argument("--gain", default="1 1", help='Gain range; use "" for automatic')
     parser.add_argument("--roi-size", type=float, default=0.3, help="Central ROI fraction")
-    parser.add_argument("--drop-ratio", type=float, default=0.7)
+    parser.add_argument("--drop-ratio", type=float, default=0.9,
+                        help="Refocus when score < reference x drop-ratio")
+    parser.add_argument("--rise-ratio", type=float, default=2.0,
+                        help="Refocus when score > reference x rise-ratio (new target)")
     parser.add_argument("--trigger-delay", type=float, default=0.4)
     parser.add_argument("--cooldown", type=float, default=2.0)
-    parser.add_argument("--af-speed", choices=("turbo", "fast", "safe"), default="turbo",
-                        help="turbo: directional search; fast: hierarchical search; safe: original scan")
-    parser.add_argument("--settle", type=float, default=None,
-                        help="Motor settle seconds; default fast=0.06, safe=0.15")
-    parser.add_argument("--motion-threshold", type=float, default=25.0,
+    parser.add_argument("--settle", type=float, default=0.06, help="Motor settle seconds")
+    parser.add_argument("--motion-threshold", type=float, default=300.0,
                         help="ROI optical flow speed limit, analysis pixels/second")
     parser.add_argument("--min-sharpness", type=float, default=20.0,
                         help="Minimum verified Tenengrad score; scene dependent")
     args = parser.parse_args()
-    if args.settle is None:
-        args.settle = 0.15 if args.af_speed == "safe" else 0.06
     if not 0.05 <= args.roi_size <= 0.9 or not 0 < args.drop_ratio < 1:
         parser.error("roi-size must be 0.05..0.9; drop-ratio must be 0..1")
+    if args.rise_ratio <= 1:
+        parser.error("rise-ratio must be > 1")
     if min(args.trigger_delay, args.cooldown, args.settle,
            args.motion_threshold, args.min_sharpness) <= 0:
         parser.error("Timing and quality thresholds must be positive")
@@ -323,9 +360,11 @@ def main():
             cv2.rectangle(display, (x, y), (x+rw, y+rh), (0, 255, 255), 2)
             ref = controller.reference
             duration = "--" if controller.last_duration is None else "{:.2f}s".format(controller.last_duration)
-            lines = ["{} | focus={} | AF count={} | {} | last={}".format(
-                         controller.state, controller.position, controller.attempts, args.af_speed, duration),
-                     "Sharpness={:.1f} | reference={}".format(sharpness, "none" if ref is None else "{:.1f}".format(ref)),
+            lines = ["{} | focus={} | AF count={} | turbo | last={}".format(
+                         controller.state, controller.position, controller.attempts, duration),
+                     "Sharpness={:.1f} | reference={}{}".format(
+                         sharpness, "none" if ref is None else "{:.1f}".format(ref),
+                         " (NO TARGET)" if ref is not None and ref < args.min_sharpness else ""),
                      "Motion={} | speed={:.1f} px/s | flow={}".format(motion, speed, "OK" if flow_known else "UNKNOWN"),
                      controller.reason, "Keep target inside yellow box | Q / Esc: exit"]
             for i, text in enumerate(lines):

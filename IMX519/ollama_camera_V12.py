@@ -20,7 +20,8 @@ if IMX519_DIR.exists():
 
 from JetsonCamera import Camera
 from Focuser import Focuser
-from Autofocus import AutoFocus
+from ContinuousAutofocus_turbo import (FocusController, RoiMeter,
+                                       add_af_arguments, check_af_args)
 
 # =========================
 # Ollama 設定
@@ -50,8 +51,9 @@ EXPOSURE_MIN_MS = 0.1
 EXPOSURE_MAX_RATIO = 0.95
 EXPOSURE_SENSOR_MAX_MS = 683.709
 EXPOSURE_STEP_MS = 1.0
+EXPOSURE_COARSE_STEP_MS = 10.0
 FOCUS_STEP = 50
-FOCUS_SETTLE_TIME = 0.05
+AF_REOPEN_WARMUP = 1.0   # seconds for auto exposure to settle after the camera reopens
 
 KEY_LEFT = (2424832, 65361, 81)
 KEY_UP = (2490368, 65362, 82)
@@ -62,6 +64,10 @@ KEY_DOWN = (2621440, 65364, 84)
 # 執行參數
 # =========================
 GRACE_FRAMES = 15
+# ByteTrack drops a lost ID after its 30-frame track buffer and never reuses it,
+# so per-track state unseen this long can be forgotten (~18 s at 17 FPS).
+FORGET_FRAMES = 300
+CLEANUP_INTERVAL_FRAMES = 30
 OCR_FRAME_INTERVAL = 5
 OCR_INTERVAL_SECONDS = 1.0
 OCR_QUEUE_SIZE = 2
@@ -402,6 +408,71 @@ def get_visible_results(frame_id: int) -> list[str]:
         return [confirmed_buses[track_id] for track_id in sorted(visible_ids)]
 
 
+def forget_stale_tracks(frame_id: int) -> None:
+    """清除超過 FORGET_FRAMES 沒出現的 ID，讓共用字典不會隨執行時間無限增長。
+
+    last_seen_frame 記錄每一個出現過的 ID，其他字典的 key 都是它的子集，掃它即可。
+    OCR 處理中的 ID 先保留：worker 只寫入處理中的 ID，結束後下一輪再一起刪除。
+    """
+    with lock:
+        stale = [
+            track_id
+            for track_id, last_frame in last_seen_frame.items()
+            if frame_id - last_frame > FORGET_FRAMES and track_id not in ocr_pending_ids
+        ]
+        for track_id in stale:
+            del last_seen_frame[track_id]
+            confirmed_buses.pop(track_id, None)
+            ocr_history.pop(track_id, None)
+            last_ocr_time.pop(track_id, None)
+    if stale:
+        print(f"Forgot {len(stale)} stale track(s): {stale}")
+
+
+class ContinuousAF:
+    """Turbo continuous AF (ContinuousAutofocus_turbo) driven by the main-loop frames.
+
+    Manual focus keys switch it off so it does not fight the user; F / Enter
+    switches it back on and refocuses immediately.
+    """
+
+    def __init__(self, focuser, args):
+        self.focuser = focuser
+        self.args = args
+        self.meter = RoiMeter(args)
+        self.enabled = not args.no_af
+        self.roi = None
+        self.restart(warmup=2.0)
+
+    def restart(self, warmup):
+        """Fresh search state at the current lens position (camera reopened, AF re-enabled)."""
+        self.controller = FocusController(
+            lambda p: self.focuser.set(Focuser.OPT_FOCUS, p),
+            self.focuser.get(Focuser.OPT_FOCUS), self.args, warmup=warmup)
+        self.meter.reset()
+
+    def enable(self):
+        self.enabled = True
+        self.restart(warmup=0.0)
+
+    def disable(self):
+        self.enabled = False
+
+    @property
+    def scanning(self):
+        """Lens is moving through search positions: frames are deliberately defocused."""
+        return self.enabled and self.controller.active
+
+    def update(self, frame, now):
+        """Must see the clean frame, before any box or text is drawn on it."""
+        if not self.enabled:
+            return
+        m = self.meter.measure(frame, now)
+        self.roi = m.roi
+        self.controller.update(now, m.sharpness, m.motion, m.valid,
+                               1.0 if self.args.no_exposure_comp else m.brightness)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="V12 YOLO + Ollama OCR using Jetson IMX519 camera."
@@ -422,7 +493,12 @@ def parse_args():
                         help="YOLO model path; default searches this folder and its parent")
     parser.add_argument("--device", default=None,
                         help="Inference device, e.g. 0, cpu; default auto")
-    return parser.parse_args()
+    parser.add_argument("--no-af", action="store_true",
+                        help="Start in manual focus; F / Enter enables continuous AF")
+    add_af_arguments(parser)
+    args = parser.parse_args()
+    check_af_args(parser, args)
+    return args
 
 
 def max_exposure_ms(framerate: int) -> float:
@@ -468,11 +544,12 @@ def reopen_camera_with_exposure(camera, cam_state, focuser=None):
 
 
 def change_framerate(camera, cam_state, focuser, direction):
+    """Return True when the camera was reopened at a new frame rate."""
     current_index = FPS_OPTIONS.index(cam_state["framerate"])
     new_index = max(0, min(len(FPS_OPTIONS) - 1, current_index + direction))
     new_fps = FPS_OPTIONS[new_index]
     if new_fps == cam_state["framerate"]:
-        return
+        return False
 
     capture_width, capture_height = SENSOR_MODES[new_fps]
     cam_state["framerate"] = new_fps
@@ -482,14 +559,29 @@ def change_framerate(camera, cam_state, focuser, direction):
         cam_state["exposure_ms"], new_fps
     )
     reopen_camera_with_exposure(camera, cam_state, focuser)
+    return True
 
 
-def draw_control_overlay(frame, cam_state, focuser, auto_focus):
+def adjust_exposure(camera, cam_state, focuser, delta_ms):
+    """Step the fixed exposure. Leaving auto exposure starts from 0 ms (going up)
+    or from the frame-rate limit (going down)."""
+    limit = max_exposure_ms(cam_state["framerate"])
+    current = cam_state["exposure_ms"]
+    if current is None:
+        current = 0.0 if delta_ms > 0 else limit
+    cam_state["exposure_ms"] = min(max(current + delta_ms, EXPOSURE_MIN_MS), limit)
+    reopen_camera_with_exposure(camera, cam_state, focuser)
+
+
+def draw_control_overlay(frame, cam_state, focuser, af):
     focus = focuser.get(Focuser.OPT_FOCUS)
-    if auto_focus.is_finished():
-        autofocus_text = "AutoFocus: Idle (best={})".format(auto_focus.best_position)
+    if af.enabled:
+        controller = af.controller
+        reference = "--" if controller.reference is None else "{:.0f}".format(controller.reference)
+        autofocus_text = "AF: {} | scans={} aborts={} ref={}".format(
+            controller.state, controller.attempts, controller.aborts, reference)
     else:
-        autofocus_text = "AutoFocus: Running"
+        autofocus_text = "AF: MANUAL (F/Enter = continuous AF)"
 
     exposure_ms = cam_state["exposure_ms"]
     exposure_text = "Exposure: Auto"
@@ -506,9 +598,13 @@ def draw_control_overlay(frame, cam_state, focuser, auto_focus):
             cam_state["capture_width"],
             cam_state["capture_height"],
         ),
-        "[/] exposure | -/= FPS | W/S or Up/Down focus | Enter/F autofocus",
-        "A auto exposure | R reset focus | C snapshot | Q/Esc exit",
+        "[/] exposure 1 ms | {/} 10 ms | A auto exposure | -/= FPS",
+        "W/S or Up/Down manual focus | R reset focus | Enter/F continuous AF",
+        "C snapshot | Q/Esc exit",
     ]
+    if af.enabled and af.roi is not None:
+        x, y, roi_width, roi_height = af.roi
+        cv2.rectangle(frame, (x, y), (x + roi_width, y + roi_height), (255, 255, 0), 1)
     for index, text in enumerate(lines):
         cv2.putText(frame, text, (20, 85 + index * 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv2.LINE_AA)
@@ -516,41 +612,46 @@ def draw_control_overlay(frame, cam_state, focuser, auto_focus):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
 
 
-def handle_camera_key(key, camera, cam_state, focuser, auto_focus, frame):
+def handle_camera_key(key, camera, cam_state, focuser, af, frame):
     key8 = key & 0xFF
+    reopened = False
     if key8 in (ord("-"), ord("_")):
-        change_framerate(camera, cam_state, focuser, -1)
+        reopened = change_framerate(camera, cam_state, focuser, -1)
     elif key8 in (ord("="), ord("+")):
-        change_framerate(camera, cam_state, focuser, 1)
+        reopened = change_framerate(camera, cam_state, focuser, 1)
+    elif key8 == ord("}"):
+        adjust_exposure(camera, cam_state, focuser, EXPOSURE_COARSE_STEP_MS)
+        reopened = True
+    elif key8 == ord("{"):
+        adjust_exposure(camera, cam_state, focuser, -EXPOSURE_COARSE_STEP_MS)
+        reopened = True
     elif key8 == ord("]") or key in KEY_RIGHT:
-        current = cam_state["exposure_ms"] or 0.0
-        cam_state["exposure_ms"] = min(
-            current + EXPOSURE_STEP_MS,
-            max_exposure_ms(cam_state["framerate"]),
-        )
-        reopen_camera_with_exposure(camera, cam_state, focuser)
+        adjust_exposure(camera, cam_state, focuser, EXPOSURE_STEP_MS)
+        reopened = True
     elif key8 == ord("[") or key in KEY_LEFT:
-        if cam_state["exposure_ms"] is None:
-            cam_state["exposure_ms"] = max_exposure_ms(cam_state["framerate"])
-        cam_state["exposure_ms"] = max(
-            cam_state["exposure_ms"] - EXPOSURE_STEP_MS,
-            EXPOSURE_MIN_MS,
-        )
-        reopen_camera_with_exposure(camera, cam_state, focuser)
+        adjust_exposure(camera, cam_state, focuser, -EXPOSURE_STEP_MS)
+        reopened = True
     elif key8 in (ord("w"), ord("W")) or key in KEY_UP:
+        af.disable()
         focuser.set(Focuser.OPT_FOCUS, focuser.get(Focuser.OPT_FOCUS) + FOCUS_STEP)
     elif key8 in (ord("s"), ord("S")) or key in KEY_DOWN:
+        af.disable()
         focuser.set(Focuser.OPT_FOCUS, focuser.get(Focuser.OPT_FOCUS) - FOCUS_STEP)
     elif key8 in (ord("f"), ord("F"), 10, 13) or key == 65421:
-        auto_focus.start_focus()
+        af.enable()
     elif key8 in (ord("r"), ord("R")):
+        af.disable()
         focuser.reset(Focuser.OPT_FOCUS)
     elif key8 in (ord("a"), ord("A")):
         cam_state["exposure_ms"] = None
         reopen_camera_with_exposure(camera, cam_state, focuser)
+        reopened = True
     elif key8 in (ord("c"), ord("C")):
         cv2.imwrite("v12_image.jpg", frame)
         print("Saved snapshot: v12_image.jpg")
+    if reopened:
+        # New pipeline, new exposure: the old search state and motion frame are stale.
+        af.restart(AF_REOPEN_WARMUP)
 
 
 def main():
@@ -589,15 +690,7 @@ def main():
     )
 
     focuser = Focuser(args.i2c_bus)
-    auto_focus = AutoFocus(
-        focuser,
-        camera,
-        roi=(0.4, 0.4, 0.2, 0.2),
-        focus_step=FOCUS_STEP,
-        move_settle_time=FOCUS_SETTLE_TIME,
-        decline_patience=5,
-        verbose=False,
-    )
+    af = ContinuousAF(focuser, args)
 
     model = YOLO(model_path)
     device = inference_device
@@ -622,13 +715,17 @@ def main():
 
             frame_id += 1
             frame = cv2.resize(frame, (args.width, args.height))
+            af.update(frame, time.monotonic())
+            # Draw only on a copy: `frame` stays clean for the OCR ROIs (views into it).
+            display = frame.copy()
             buses = detect_bus(frame)
             current_ids = {bus[5] for bus in buses}
 
             with lock:
                 for track_id in current_ids:
-                    if track_id in confirmed_buses:
-                        last_seen_frame[track_id] = frame_id
+                    last_seen_frame[track_id] = frame_id
+            if frame_id % CLEANUP_INTERVAL_FRAMES == 0:
+                forget_stale_tracks(frame_id)
 
             for x1, y1, x2, y2, confidence, track_id in buses:
                 width, height = x2 - x1, y2 - y1
@@ -636,15 +733,15 @@ def main():
                     continue
 
                 roi, (rx1, ry1, rx2, ry2) = extract_sign_roi(frame, x1, y1, x2, y2)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 0, 255), 2)
+                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.rectangle(display, (rx1, ry1), (rx2, ry2), (0, 0, 255), 2)
 
                 with lock:
                     confirmed_result = confirmed_buses.get(track_id)
 
                 if confirmed_result:
                     cv2.putText(
-                        frame,
+                        display,
                         f"BUS ID:{track_id} -> {confirmed_result}",
                         (x1, max(25, y1 - 10)),
                         cv2.FONT_HERSHEY_SIMPLEX,
@@ -661,6 +758,9 @@ def main():
                     label = f"BUS ID:{track_id} [ROI TOO SMALL]"
                 elif not aspect_ratio_min <= aspect_ratio <= aspect_ratio_max:
                     label = f"BUS ID:{track_id} [ANGLE FILTER]"
+                elif af.scanning:
+                    # Lens is moving through search positions; OCR resumes once focused.
+                    label = f"BUS ID:{track_id} [AF SCAN]"
                 elif frame_id % OCR_FRAME_INTERVAL == 0:
                     roi_height, roi_width = roi.shape[:2]
                     if roi_width < TARGET_OCR_MIN_SIDE or roi_height < TARGET_OCR_MIN_SIDE:
@@ -668,7 +768,7 @@ def main():
                     schedule_ocr(track_id, roi, time.monotonic())
 
                 cv2.putText(
-                    frame,
+                    display,
                     label,
                     (x1, max(25, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX,
@@ -681,7 +781,7 @@ def main():
             display_text = ",".join(final_results) if final_results else "NONE"
             color = (255, 0, 0) if final_results else (0, 165, 255)
             cv2.putText(
-                frame,
+                display,
                 f"BUS NUMBER: {display_text} | IMX519 {cam_state['framerate']} FPS",
                 (20, 50),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -689,15 +789,15 @@ def main():
                 color,
                 2,
             )
-            draw_control_overlay(frame, cam_state, focuser, auto_focus)
-            cv2.imshow("Bus Detection", frame)
+            draw_control_overlay(display, cam_state, focuser, af)
+            cv2.imshow("Bus Detection", display)
 
             key = cv2.waitKeyEx(10)
             if key == -1:
                 continue
             if key == 27 or (key & 0xFF) in (ord("q"), ord("Q")):
                 break
-            handle_camera_key(key, camera, cam_state, focuser, auto_focus, frame)
+            handle_camera_key(key, camera, cam_state, focuser, af, display)
     finally:
         camera.close()
         cv2.destroyAllWindows()

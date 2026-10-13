@@ -1,4 +1,5 @@
 import base64
+import math
 import re
 import threading
 import time
@@ -15,6 +16,11 @@ from ultralytics import YOLO
 # =========================
 OLLAMA_URL = "http://192.168.0.110:11434/api/chat"
 MODEL_NAME = "qwen3-vl:4B-instruct"
+# 每次 OCR 只用約 100～320 個 token（提示詞 + 一張 ROI；實測最大 317，為 512x512 的 ROI），2048 已足夠；
+# context 越小 KV cache 越小，Jetson 的 CPU/GPU 共用記憶體較不易吃緊。
+# context 只在模型載入時決定：模型已載入時，請求帶較小的 num_ctx 不會重新載入（Ollama 0.17.7 實測 ps 不變）。
+# 要確實套用新值，先在伺服器執行 ollama stop qwen3-vl:4B-instruct 卸載模型，再啟動本程式。
+OLLAMA_NUM_CTX = 2048
 
 # =========================
 # GPU / YOLO
@@ -24,7 +30,13 @@ print("Device:", device)
 
 model = YOLO("yolov8n.pt")
 half = device == "cuda"
-VIDEO_PATH = "C:/Users/Mitnick/Desktop/FCU/VS_Code/ocr_codex/bus_image/bus_14.mp4"
+VIDEO_PATH = "C:/Users/Mitnick/Desktop/FCU/VS_Code/ocr_codex/bus_image/bus_2.mp4"
+# 偵測、OCR 與顯示畫面固定為橫式 1280x720 或直式 720x1280，依影片方向自動選擇；
+# 長寬比不是 16:9 的影片（例如 4:3）等比例縮放後補黑邊，不會變形。
+LANDSCAPE_SIZE = (1280, 720)
+PORTRAIT_SIZE = (720, 1280)
+YOLO_STRIDE = 32
+WINDOW_NAME = "Bus Detection"
 
 # =========================
 # 執行參數
@@ -34,8 +46,15 @@ OCR_FRAME_INTERVAL = 5
 OCR_INTERVAL_SECONDS = 1.0
 OCR_QUEUE_SIZE = 2
 CONFIRMATIONS_REQUIRED = 2
+# 看板讀不清楚時，模型會把提示詞的「1 至 4 位數字」照抄成 1234；視同 NONE。
+# bus_21 實測：過曝看板依序回傳 1234 -> NONE -> 1234，因 NONE 不重置計數而被確認成 1234。
+INVALID_RESULTS = {"1234"}
+# 追蹤 ID 超過此影格數未出現就清除其狀態，避免長時間執行時字典持續成長。
+# ByteTrack 丟失 30 格後即移除該 ID 且不再重用，因此必須大於 30 與 GRACE_FRAMES。
+STALE_TRACK_FRAMES = 300
+PRUNE_INTERVAL_FRAMES = 100
 
-# 小於 32 px 的圖片會讓 qwen3-vl runner 回 500；V12 先保留小 ROI，再放大後送出。
+# 任一邊小於 32 px 的圖片會讓 qwen3-vl runner 當掉（回 500）；小 ROI 放大後送出，大 ROI 縮到 MAX_OCR_SIDE。
 OLLAMA_MIN_IMAGE_SIDE = 32
 TARGET_OCR_MIN_SIDE = 96
 MAX_OCR_SIDE = 512
@@ -78,7 +97,7 @@ def warmup_ollama():
         ],
         "stream": False,
         "keep_alive": -1,
-        "options": {"num_predict": 1, "temperature": 0},
+        "options": {"num_ctx": OLLAMA_NUM_CTX, "num_predict": 1, "temperature": 0},
     }
 
     try:
@@ -160,8 +179,12 @@ def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
     return enhanced
 
 
-def upscale_for_ocr(roi_img: np.ndarray) -> np.ndarray:
-    """等比例放大 ROI，避免小圖觸發 500，並提升小看板 OCR 辨識率。"""
+def resize_for_ocr(roi_img: np.ndarray) -> np.ndarray:
+    """等比例縮放 ROI：小圖放大（任一邊 < 32 px 會讓 Ollama runner 當掉），大圖縮到 MAX_OCR_SIDE。
+
+    Ollama 會再把影像縮放成 32 的倍數，未滿 65536 像素的一律放大到約 65536 像素，
+    但大圖不會縮小；不先縮小時，1280x720 的 ROI 會用掉約 880 個影像 token。
+    """
     height, width = roi_img.shape[:2]
     scale = max(
         1.0,
@@ -175,19 +198,19 @@ def upscale_for_ocr(roi_img: np.ndarray) -> np.ndarray:
     if max_scaled_side > MAX_OCR_SIDE:
         scale = MAX_OCR_SIDE / max(width, height)
 
-    if scale <= 1.0:
+    if scale == 1.0:
         return roi_img
 
     output_width = max(OLLAMA_MIN_IMAGE_SIDE, round(width * scale))
     output_height = max(OLLAMA_MIN_IMAGE_SIDE, round(height * scale))
     print(
-        f"[upscale_for_ocr] {width}x{height} -> "
+        f"[resize_for_ocr] {width}x{height} -> "
         f"{output_width}x{output_height}, scale={scale:.2f}"
     )
     return cv2.resize(
         roi_img,
         (output_width, output_height),
-        interpolation=cv2.INTER_CUBIC,
+        interpolation=cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA,
     )
 
 
@@ -215,7 +238,7 @@ def extract_sign_roi(frame: np.ndarray, x1: int, y1: int,
 
 
 def is_valid_roi(roi_img: np.ndarray) -> bool:
-    """只過濾空圖或極端小圖；其餘小 ROI 交給 upscale_for_ocr 放大。"""
+    """只過濾空圖或極端小圖；其餘小 ROI 交給 resize_for_ocr 放大。"""
     if roi_img is None or roi_img.size == 0:
         return False
     height, width = roi_img.shape[:2]
@@ -229,7 +252,7 @@ def is_valid_roi(roi_img: np.ndarray) -> bool:
 def normalize_ocr_result(result: str) -> str | None:
     """只接受 1 至 4 位數字，避免模型說明文字進入投票確認。"""
     compact = re.sub(r"\s+", "", result)
-    if compact.upper() == "NONE":
+    if compact.upper() == "NONE" or compact in INVALID_RESULTS:
         return None
     return compact if re.fullmatch(r"\d{1,4}", compact) else None
 
@@ -238,7 +261,7 @@ def normalize_ocr_result(result: str) -> str | None:
 # OCR worker（受限佇列，避免多台車同時建立大量執行緒）
 # =========================
 def process_ocr(track_id: int, roi_img: np.ndarray):
-    prepared_roi = enhance_roi(upscale_for_ocr(roi_img))
+    prepared_roi = enhance_roi(resize_for_ocr(roi_img))
     payload = {
         "model": MODEL_NAME,
         "messages": [
@@ -254,6 +277,8 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
         ],
         "stream": False,
         "keep_alive": -1,
+        # 模型預設 temperature=1 會隨機取樣；固定為 0 讓同一張圖得到相同答案，較快湊到連續確認。
+        "options": {"num_ctx": OLLAMA_NUM_CTX, "temperature": 0},
     }
     response = ollama_session.post(OLLAMA_URL, json=payload, timeout=60)
     response.raise_for_status()
@@ -296,10 +321,67 @@ def ocr_worker():
 # =========================
 # YOLO detection
 # =========================
+def letterbox_params(height: int, width: int) -> tuple[int, int, int, int, float, int, int]:
+    """原始影格 -> 顯示畫面的轉換：(目標寬, 目標高, 縮放後寬, 縮放後高, 縮放比例, 左黑邊, 上黑邊)。
+
+    prepare_display 與 crop_source_roi 共用，確保兩邊的座標換算一致。
+    """
+    target_width, target_height = PORTRAIT_SIZE if height > width else LANDSCAPE_SIZE
+    scale = min(target_width / width, target_height / height)
+    new_width, new_height = round(width * scale), round(height * scale)
+    offset_x = (target_width - new_width) // 2
+    offset_y = (target_height - new_height) // 2
+    return target_width, target_height, new_width, new_height, scale, offset_x, offset_y
+
+
+def prepare_display(frame: np.ndarray) -> np.ndarray:
+    """依影片方向輸出 1280x720 或 720x1280；長寬比不同時等比例縮放並置中補黑邊，不拉伸。
+
+    一律回傳新陣列：之後在顯示畫面上畫框，不會污染用來裁切 ROI 的原始影格。
+    """
+    height, width = frame.shape[:2]
+    target_width, target_height, new_width, new_height, scale, x, y = letterbox_params(height, width)
+    if (new_width, new_height) == (width, height):
+        resized = frame.copy()
+    else:
+        resized = cv2.resize(
+            frame,
+            (new_width, new_height),
+            interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR,
+        )
+    if (new_width, new_height) == (target_width, target_height):
+        return resized
+
+    canvas = np.zeros((target_height, target_width, 3), dtype=frame.dtype)
+    canvas[y:y + new_height, x:x + new_width] = resized
+    return canvas
+
+
+def crop_source_roi(source_frame: np.ndarray,
+                    roi_box: tuple[int, int, int, int]) -> np.ndarray:
+    """把顯示畫面座標的 ROI 換算回原始影格再裁切。
+
+    高解析度影片（例如 2160x3840）縮成 720x1280 後只剩 1/3 解析度；從原始影格裁切可保留遠處看板的細節，
+    過大的 ROI 之後再由 resize_for_ocr 縮到 MAX_OCR_SIDE。
+    """
+    height, width = source_frame.shape[:2]
+    *_, scale, offset_x, offset_y = letterbox_params(height, width)
+    rx1, ry1, rx2, ry2 = roi_box
+    sx1, sx2 = (min(max(round((x - offset_x) / scale), 0), width) for x in (rx1, rx2))
+    sy1, sy2 = (min(max(round((y - offset_y) / scale), 0), height) for y in (ry1, ry2))
+    return source_frame[sy1:sy2, sx1:sx2]
+
+
 def detect_bus(frame):
+    # imgsz 依畫面方向取 stride 倍數，避免直式畫面被塞進橫式輸入而縮小
+    height, width = frame.shape[:2]
+    imgsz = (
+        math.ceil(height / YOLO_STRIDE) * YOLO_STRIDE,
+        math.ceil(width / YOLO_STRIDE) * YOLO_STRIDE,
+    )
     results = model.track(
         frame,
-        imgsz=(768, 1280),
+        imgsz=imgsz,
         device=device,
         classes=[5],
         conf=0.2,
@@ -347,7 +429,22 @@ def get_visible_results(frame_id: int) -> list[str]:
             for track_id, last_frame in last_seen_frame.items()
             if frame_id - last_frame <= GRACE_FRAMES and track_id in confirmed_buses
         ]
-        return [confirmed_buses[track_id] for track_id in sorted(visible_ids)]
+        numbers = [confirmed_buses[track_id] for track_id in sorted(visible_ids)]
+        # 同一台車可能因 ID 切換或長車身被拆成前後兩框而有多個 ID，顯示時去除重複號碼
+        return list(dict.fromkeys(numbers))
+
+
+def prune_stale_tracks(frame_id: int):
+    """清除長時間未出現的追蹤 ID；仍在 OCR 中的 ID 保留，避免 worker 寫回已刪除的狀態。"""
+    with lock:
+        stale_ids = [
+            track_id
+            for track_id, last_frame in last_seen_frame.items()
+            if frame_id - last_frame > STALE_TRACK_FRAMES and track_id not in ocr_pending_ids
+        ]
+        for track_id in stale_ids:
+            for state in (confirmed_buses, last_seen_frame, last_ocr_time, ocr_history):
+                state.pop(track_id, None)
 
 
 def main():
@@ -361,29 +458,38 @@ def main():
     frame_id = 0
     aspect_ratio_min = 0.0
     aspect_ratio_max = 1.8
+    # Win32 版 OpenCV 不支援 WINDOW_KEEPRATIO，WINDOW_NORMAL 會把影像拉伸到視窗大小；
+    # 用 AUTOSIZE 讓視窗等於畫面大小（1280x720 或 720x1280），並放在螢幕左上角。
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
+    cv2.moveWindow(WINDOW_NAME, 0, 0)
 
     while True:
-        ret, frame = cap.read()
+        ret, source_frame = cap.read()
         if not ret:
             break
 
         frame_id += 1
-        frame = cv2.resize(frame, (720, 1280))
-        ##frame = cv2.resize(frame, (1280, 720))
+        # 偵測與顯示用 1280x720 / 720x1280 的畫面；ROI 從未縮小、未畫框的原始影格裁切
+        frame = prepare_display(source_frame)
+        if frame_id == 1:
+            print(f"Source size: {source_frame.shape[1]}x{source_frame.shape[0]}, "
+                  f"display size: {frame.shape[1]}x{frame.shape[0]}")
         buses = detect_bus(frame)
-        current_ids = {bus[5] for bus in buses}
 
         with lock:
-            for track_id in current_ids:
-                if track_id in confirmed_buses:
-                    last_seen_frame[track_id] = frame_id
+            # 記錄所有 ID（不只已確認的），才能判斷哪些 ID 已消失並清除
+            for bus in buses:
+                last_seen_frame[bus[5]] = frame_id
 
         for x1, y1, x2, y2, confidence, track_id in buses:
             width, height = x2 - x1, y2 - y1
             if width <= 0 or height <= 0:
                 continue
 
-            roi, (rx1, ry1, rx2, ry2) = extract_sign_roi(frame, x1, y1, x2, y2)
+            # extract_sign_roi 只用來算顯示座標的看板框，影像改從原始影格裁切
+            _, roi_box = extract_sign_roi(frame, x1, y1, x2, y2)
+            roi = crop_source_roi(source_frame, roi_box)
+            rx1, ry1, rx2, ry2 = roi_box
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 0, 255), 2)
 
@@ -425,6 +531,9 @@ def main():
                 2,
             )
 
+        if frame_id % PRUNE_INTERVAL_FRAMES == 0:
+            prune_stale_tracks(frame_id)
+
         final_results = get_visible_results(frame_id)
         display_text = ",".join(final_results) if final_results else "NONE"
         color = (255, 0, 0) if final_results else (0, 165, 255)
@@ -437,7 +546,7 @@ def main():
             color,
             2,
         )
-        cv2.imshow("Bus Detection", frame)
+        cv2.imshow(WINDOW_NAME, frame)
 
         if cv2.waitKey(10) & 0xFF == ord("q"):
             break

@@ -1,6 +1,7 @@
 import base64
 import argparse
 import re
+import signal
 import sys
 import threading
 import time
@@ -26,7 +27,7 @@ from ContinuousAutofocus_turbo import (FocusController, RoiMeter,
 # =========================
 # Ollama 設定
 # =========================
-OLLAMA_URL = "http://192.168.0.110:11434/api/chat"
+OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "qwen3-vl:4B-instruct"
 OLLAMA_NUM_CTX = 1024
 
@@ -80,6 +81,13 @@ MAX_OCR_SIDE = 512
 MIN_SOURCE_ROI_WIDTH = 4
 MIN_SOURCE_ROI_HEIGHT = 4
 MIN_SOURCE_ROI_AREA = 48
+
+# =========================
+# MP4 錄影（--record）
+# =========================
+RECORD_DEFAULT_MAX_FPS = 30
+RECORD_QUEUE_SIZE = 16      # annotated frames waiting for the encoder (~2.7 MB each at 720p)
+RECORD_MAX_STALL = 2.0      # seconds a frozen camera (e.g. reopening) is shown in the video
 
 # =========================
 # 共用狀態
@@ -495,9 +503,17 @@ def parse_args():
                         help="Inference device, e.g. 0, cpu; default auto")
     parser.add_argument("--no-af", action="store_true",
                         help="Start in manual focus; F / Enter enables continuous AF")
+    parser.add_argument("--record", nargs="?", const="", default=None, metavar="FILE",
+                        help="Save the window's video as MP4; without FILE: "
+                             "record_<date>_<time>.mp4 in the current directory")
+    parser.add_argument("--record-fps", type=float, default=None,
+                        help="MP4 frame rate; default: camera FPS, at most "
+                             f"{RECORD_DEFAULT_MAX_FPS}")
     add_af_arguments(parser)
     args = parser.parse_args()
     check_af_args(parser, args)
+    if args.record_fps is not None and args.record_fps <= 0:
+        parser.error("--record-fps must be > 0")
     return args
 
 
@@ -654,8 +670,94 @@ def handle_camera_key(key, camera, cam_state, focuser, af, frame):
         af.restart(AF_REOPEN_WARMUP)
 
 
+def open_video_writer(path, fps, size):
+    """MP4 writer: OpenCV's FFmpeg backend (MPEG-4), else a GStreamer x264 pipeline."""
+    writer = cv2.VideoWriter(str(path), cv2.CAP_FFMPEG,
+                             cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
+    if writer.isOpened():
+        return writer, "FFmpeg mp4v"
+    writer.release()
+    pipeline = (
+        "appsrc ! videoconvert ! video/x-raw,format=I420 ! "
+        "x264enc speed-preset=ultrafast tune=zerolatency ! h264parse ! "
+        f'mp4mux ! filesink location="{path}"'
+    )
+    writer = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, fps, size)
+    if writer.isOpened():
+        return writer, "GStreamer x264"
+    raise RuntimeError(f"Cannot open an MP4 writer for {path} "
+                       "(OpenCV has neither FFmpeg nor GStreamer x264enc)")
+
+
+class VideoRecorder:
+    """Encodes the displayed frames to MP4 on a background thread.
+
+    The file has a fixed frame rate but frames arrive at YOLO's uneven pace, so
+    each frame is held or dropped by its capture time: the video plays back in
+    real time. A full queue (encoder too slow) drops frames rather than slowing
+    recognition down.
+    """
+
+    def __init__(self, path, fps, size):
+        self.path = Path(path).resolve()
+        self.fps = fps
+        self.writer, self.backend = open_video_writer(self.path, fps, size)
+        self.queue = Queue(maxsize=RECORD_QUEUE_SIZE)
+        self.start_time = None
+        self.last_image = None
+        self.written = 0
+        self.dropped = 0
+        self.thread = threading.Thread(target=self._run, daemon=True, name="mp4-recorder")
+        self.thread.start()
+
+    @property
+    def seconds(self):
+        return self.written / self.fps
+
+    def add(self, image, timestamp):
+        try:
+            self.queue.put_nowait((image, timestamp))
+        except Full:
+            self.dropped += 1
+
+    def _run(self):
+        max_hold = max(1, round(self.fps * RECORD_MAX_STALL))
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            image, timestamp = item
+            if self.start_time is None:
+                self.start_time = timestamp
+            slot = int((timestamp - self.start_time) * self.fps)
+            if slot - self.written > max_hold:
+                # Long stall: keep only RECORD_MAX_STALL seconds of it.
+                self.start_time += (slot - self.written - max_hold) / self.fps
+                slot = self.written + max_hold
+            # Hold the previous frame until this one's time, then show this one.
+            while self.written < slot:
+                self.writer.write(self.last_image)
+                self.written += 1
+            if self.written == slot:
+                self.writer.write(image)
+                self.written += 1
+            self.last_image = image
+
+    def close(self):
+        """Encode what is queued and finalise the file (an MP4 is unreadable without it)."""
+        self.queue.put(None)
+        self.thread.join()
+        self.writer.release()
+
+
 def main():
     global model, half, device
+
+    # `kill <pid>` and a dropped SSH session still run the finally block, so an
+    # MP4 being recorded is finalised. SIGHUP is left alone when nohup ignores it.
+    signal.signal(signal.SIGTERM, lambda signum, stack: sys.exit(0))
+    if hasattr(signal, "SIGHUP") and signal.getsignal(signal.SIGHUP) == signal.SIG_DFL:
+        signal.signal(signal.SIGHUP, lambda signum, stack: sys.exit(0))
 
     args = parse_args()
     model_path = resolve_model_path(args.model)
@@ -703,7 +805,14 @@ def main():
     aspect_ratio_min = 0.0
     aspect_ratio_max = 1.8
 
+    recorder = None
     try:
+        if args.record is not None:
+            record_path = args.record or time.strftime("record_%Y%m%d_%H%M%S.mp4")
+            record_fps = args.record_fps or min(args.framerate, RECORD_DEFAULT_MAX_FPS)
+            recorder = VideoRecorder(record_path, record_fps, (args.width, args.height))
+            print(f"Recording {recorder.path} ({recorder.backend}, {record_fps:g} FPS)")
+
         while True:
             try:
                 frame = camera.getFrame(timeout=2.0)
@@ -714,6 +823,7 @@ def main():
                 continue
 
             frame_id += 1
+            frame_time = time.monotonic()
             frame = cv2.resize(frame, (args.width, args.height))
             af.update(frame, time.monotonic())
             # Draw only on a copy: `frame` stays clean for the OCR ROIs (views into it).
@@ -790,6 +900,8 @@ def main():
                 2,
             )
             draw_control_overlay(display, cam_state, focuser, af)
+            if recorder is not None:
+                recorder.add(display, frame_time)
             cv2.imshow("Bus Detection", display)
 
             key = cv2.waitKeyEx(10)
@@ -799,8 +911,13 @@ def main():
                 break
             handle_camera_key(key, camera, cam_state, focuser, af, display)
     finally:
+        if recorder is not None:
+            recorder.close()
         camera.close()
         cv2.destroyAllWindows()
+        if recorder is not None:
+            print(f"Saved video: {recorder.path} ({recorder.seconds:.1f} s, "
+                  f"{recorder.dropped} frames dropped)")
 
 
 if __name__ == "__main__":

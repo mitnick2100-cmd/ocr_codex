@@ -1,5 +1,16 @@
 """Headless IMX519 bus-number recognition: the main.py pipeline without an OpenCV window.
 
+The camera outputs a --source-width x --source-height frame (default 3840x2160).
+YOLO, autofocus (--roi-size default 0.2), snapshots and the MP4 use the
+--width x --height processing frame (default 1280x720) resized from it, while
+the sign ROI sent to Ollama is cropped from the large frame. The ROI is never
+enlarged: only ROIs longer than MAX_OCR_SIDE are shrunk, and a ROI with a side
+under OLLAMA_MIN_IMAGE_SIDE (32 px, which crashes the qwen3-vl runner) is not
+sent at all and is labelled [ROI TOO SMALL]. A bus is confirmed after two
+identical OCR results in a row (nohead_onetime_main.py confirms after one).
+OCR log lines carry a timestamp, the cropped and sent sizes and the Ollama
+round-trip time.
+
 Meant for running over SSH: results and status lines go to the terminal, and the
 camera controls are single key presses read from that terminal (no Enter needed).
 Press C to save an annotated snapshot when you need to see the picture, or run
@@ -51,7 +62,7 @@ from ContinuousAutofocus_turbo import (FocusController, RoiMeter,
 # =========================
 # Ollama 設定
 # =========================
-OLLAMA_URL = "http://192.168.0.110:11434/api/chat"
+OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "qwen3-vl:4B-instruct"
 OLLAMA_NUM_CTX = 1024
 
@@ -92,14 +103,17 @@ OCR_FRAME_INTERVAL = 5
 OCR_INTERVAL_SECONDS = 1.0
 OCR_QUEUE_SIZE = 2
 CONFIRMATIONS_REQUIRED = 2
+# 看板讀不清楚時，模型會把提示詞的「1 至 4 位數字」照抄成 1234；視同 NONE。
+# bus_21 實測：過曝看板依序回傳 1234 -> NONE -> 1234，因 NONE 不重置計數而被確認成 1234。
+INVALID_RESULTS = {"1234"}
 
-# 小於 32 px 的圖片會讓 qwen3-vl runner 回 500；V12 先保留小 ROI，再放大後送出。
+# 小於 32 px 的圖片會讓 qwen3-vl runner 回 500；此版本不放大，這種 ROI 直接不送 OCR。
+# 高解析度裁切的 ROI 可能超過 1000 px 寬，一律縮到 MAX_OCR_SIDE，
+# 否則影像 token 會超過 OLLAMA_NUM_CTX（4K 來源的 ROI 約 2000 個 token）。
 OLLAMA_MIN_IMAGE_SIDE = 32
-TARGET_OCR_MIN_SIDE = 96
 MAX_OCR_SIDE = 512
-MIN_SOURCE_ROI_WIDTH = 4
-MIN_SOURCE_ROI_HEIGHT = 4
-MIN_SOURCE_ROI_AREA = 48
+MIN_SOURCE_ROI_WIDTH = OLLAMA_MIN_IMAGE_SIDE
+MIN_SOURCE_ROI_HEIGHT = OLLAMA_MIN_IMAGE_SIDE
 
 # =========================
 # 共用狀態
@@ -237,34 +251,24 @@ def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
     return enhanced
 
 
-def upscale_for_ocr(roi_img: np.ndarray) -> np.ndarray:
-    """等比例放大 ROI，避免小圖觸發 500，並提升小看板 OCR 辨識率。"""
+def shrink_for_ocr(roi_img: np.ndarray) -> np.ndarray:
+    """只縮不放：最長邊超過 MAX_OCR_SIDE 才等比例縮小（控制影像 token），其餘原尺寸送出。"""
     height, width = roi_img.shape[:2]
-    scale = max(
-        1.0,
-        OLLAMA_MIN_IMAGE_SIDE / width,
-        OLLAMA_MIN_IMAGE_SIDE / height,
-        TARGET_OCR_MIN_SIDE / width,
-        TARGET_OCR_MIN_SIDE / height,
-    )
-
-    max_scaled_side = max(width, height) * scale
-    if max_scaled_side > MAX_OCR_SIDE:
-        scale = MAX_OCR_SIDE / max(width, height)
-
-    if scale <= 1.0:
+    if max(width, height) <= MAX_OCR_SIDE:
         return roi_img
 
+    scale = MAX_OCR_SIDE / max(width, height)
+    # 看板 ROI 長寬比約 2～6，縮到 512 後短邊仍遠大於 32；max() 只是防極端比例觸發 500
     output_width = max(OLLAMA_MIN_IMAGE_SIDE, round(width * scale))
     output_height = max(OLLAMA_MIN_IMAGE_SIDE, round(height * scale))
     print(
-        f"[upscale_for_ocr] {width}x{height} -> "
+        f"[shrink_for_ocr] {width}x{height} -> "
         f"{output_width}x{output_height}, scale={scale:.2f}"
     )
     return cv2.resize(
         roi_img,
         (output_width, output_height),
-        interpolation=cv2.INTER_CUBIC,
+        interpolation=cv2.INTER_AREA,
     )
 
 
@@ -291,22 +295,31 @@ def extract_sign_roi(frame: np.ndarray, x1: int, y1: int,
     return frame[ry1:ry2, rx1:rx2], roi_box
 
 
+def crop_source_roi(source_frame: np.ndarray,
+                    roi_box: tuple[int, int, int, int],
+                    frame_size: tuple[int, int]) -> np.ndarray:
+    """把處理畫面（frame_size = 寬, 高）座標的 ROI 換算到高解析度來源影格再裁切。"""
+    source_height, source_width = source_frame.shape[:2]
+    scale_x = source_width / frame_size[0]
+    scale_y = source_height / frame_size[1]
+    rx1, ry1, rx2, ry2 = roi_box
+    sx1, sx2 = (min(max(round(x * scale_x), 0), source_width) for x in (rx1, rx2))
+    sy1, sy2 = (min(max(round(y * scale_y), 0), source_height) for y in (ry1, ry2))
+    return source_frame[sy1:sy2, sx1:sx2]
+
+
 def is_valid_roi(roi_img: np.ndarray) -> bool:
-    """只過濾空圖或極端小圖；其餘小 ROI 交給 upscale_for_ocr 放大。"""
+    """任一邊小於 32 px 就不送 OCR：此版本不放大，送出會讓 qwen3-vl runner 回 500。"""
     if roi_img is None or roi_img.size == 0:
         return False
     height, width = roi_img.shape[:2]
-    return (
-        width >= MIN_SOURCE_ROI_WIDTH
-        and height >= MIN_SOURCE_ROI_HEIGHT
-        and width * height >= MIN_SOURCE_ROI_AREA
-    )
+    return width >= MIN_SOURCE_ROI_WIDTH and height >= MIN_SOURCE_ROI_HEIGHT
 
 
 def normalize_ocr_result(result: str) -> str | None:
     """只接受 1 至 4 位數字，避免模型說明文字進入投票確認。"""
     compact = re.sub(r"\s+", "", result)
-    if compact.upper() == "NONE":
+    if compact.upper() == "NONE" or compact in INVALID_RESULTS:
         return None
     return compact if re.fullmatch(r"\d{1,4}", compact) else None
 
@@ -315,7 +328,9 @@ def normalize_ocr_result(result: str) -> str | None:
 # OCR worker（受限佇列，避免多台車同時建立大量執行緒）
 # =========================
 def process_ocr(track_id: int, roi_img: np.ndarray):
-    prepared_roi = enhance_roi(upscale_for_ocr(roi_img))
+    roi_height, roi_width = roi_img.shape[:2]
+    prepared_roi = enhance_roi(shrink_for_ocr(roi_img))
+    sent_height, sent_width = prepared_roi.shape[:2]
     payload = {
         "model": MODEL_NAME,
         "messages": [
@@ -333,11 +348,14 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
         "keep_alive": -1,
         "options": {"num_ctx": OLLAMA_NUM_CTX},
     }
+    started = time.monotonic()
     response = ollama_session.post(OLLAMA_URL, json=payload, timeout=60)
     response.raise_for_status()
     raw_result = response.json()["message"]["content"].strip()
     result = normalize_ocr_result(raw_result)
-    print(f"OCR [ID:{track_id}] = {raw_result!r}")
+    print(f"[{time.strftime('%H:%M:%S')}] OCR [ID:{track_id}] = {raw_result!r} "
+          f"| source ROI {roi_width}x{roi_height} -> sent {sent_width}x{sent_height} "
+          f"| {time.monotonic() - started:.2f} s")
 
     if result is None:
         return
@@ -353,7 +371,7 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
         print(f"ID:{track_id} {result} ({history['count']}/{CONFIRMATIONS_REQUIRED})")
         if history["count"] >= CONFIRMATIONS_REQUIRED:
             confirmed_buses[track_id] = result
-            print(f"CONFIRMED [ID:{track_id}] {result}")
+            print(f"[{time.strftime('%H:%M:%S')}] CONFIRMED [ID:{track_id}] {result}")
 
 
 def ocr_worker():
@@ -501,6 +519,11 @@ def parse_args():
                         help="Processing width. Default: 1280")
     parser.add_argument("--height", type=int, default=720,
                         help="Processing height. Default: 720")
+    parser.add_argument("--source-width", type=int, default=3840,
+                        help="Camera output width; the OCR ROI is cropped from this frame. "
+                             "Default: 3840")
+    parser.add_argument("--source-height", type=int, default=2160,
+                        help="Camera output height. Default: 2160")
     parser.add_argument("--framerate", type=int, choices=FPS_OPTIONS, default=17,
                         help="IMX519 FPS. Supported: 9, 15, 17, 60, 120")
     parser.add_argument("--exposure", type=float, default=None,
@@ -526,12 +549,20 @@ def parse_args():
                         help="MP4 frame rate; default: camera FPS, at most "
                              f"{RECORD_DEFAULT_MAX_FPS}")
     add_af_arguments(parser)
+    # 對焦 ROI 預設改為畫面中央 20%（共用模組 ContinuousAutofocus_turbo 的預設 0.3 不變）
+    parser.set_defaults(roi_size=0.2)
     args = parser.parse_args()
     check_af_args(parser, args)
     if args.status_interval < 0:
         parser.error("--status-interval must be >= 0")
     if args.record_fps is not None and args.record_fps <= 0:
         parser.error("--record-fps must be > 0")
+    if args.source_width < args.width or args.source_height < args.height:
+        parser.error("--source-width/--source-height must be at least --width/--height")
+    # 長寬比不同時 ROI 換算仍正確，但處理畫面會被拉伸，YOLO 看到的車子會變形
+    if abs(args.source_width / args.source_height - args.width / args.height) > 0.01:
+        print("Warning: source and processing aspect ratios differ; "
+              "the processing frame will be stretched")
     return args
 
 
@@ -953,14 +984,15 @@ def main():
     }
 
     print(
-        "Opening IMX519: {}x{} @ {} FPS, sensor mode {}x{}".format(
-            args.width, args.height, args.framerate,
-            capture_width, capture_height,
+        "Opening IMX519: source {}x{} (OCR ROI), processing {}x{} (YOLO) "
+        "@ {} FPS, sensor mode {}x{}".format(
+            args.source_width, args.source_height, args.width, args.height,
+            args.framerate, capture_width, capture_height,
         )
     )
     camera = Camera(
-        width=args.width,
-        height=args.height,
+        width=args.source_width,
+        height=args.source_height,
         framerate=args.framerate,
         exposure_time_ns=exposure_ns,
         gain_range=gain_range,
@@ -980,6 +1012,7 @@ def main():
     threading.Thread(target=ocr_worker, daemon=True, name="ollama-ocr-worker").start()
 
     frame_id = 0
+    processing_size = (args.width, args.height)
     aspect_ratio_min = 0.0
     aspect_ratio_max = 1.8
     bus_text = None
@@ -1001,20 +1034,21 @@ def main():
 
         while True:
             try:
-                frame = camera.getFrame(timeout=2.0)
+                source_frame = camera.getFrame(timeout=2.0)
             except Empty:
                 print("2 秒內沒有收到 IMX519 影像（相機沒有出圖，請看上方 GStreamer / Argus 錯誤）")
                 continue
             except Exception as error:
                 print("等待 IMX519 影像失敗:", error)
                 continue
-            if frame is None:
+            if source_frame is None:
                 continue
 
             frame_id += 1
             frame_time = time.monotonic()
             frame_times.append(frame_time)
-            frame = cv2.resize(frame, (args.width, args.height))
+            # YOLO / AF / 畫面輸出用縮小的處理畫面；看板 ROI 之後從 source_frame 裁切
+            frame = cv2.resize(source_frame, processing_size, interpolation=cv2.INTER_AREA)
             af.update(frame, time.monotonic())
             buses = detect_bus(frame)
             current_ids = {bus[5] for bus in buses}
@@ -1032,7 +1066,9 @@ def main():
                 if width <= 0 or height <= 0:
                     continue
 
-                roi, roi_box = extract_sign_roi(frame, x1, y1, x2, y2)
+                # roi_box 是處理畫面座標（畫框用）；送 OCR 的影像從高解析度來源裁切
+                _, roi_box = extract_sign_roi(frame, x1, y1, x2, y2)
+                roi = crop_source_roi(source_frame, roi_box, processing_size)
 
                 with lock:
                     confirmed_result = confirmed_buses.get(track_id)
@@ -1054,9 +1090,6 @@ def main():
                     # Lens is moving through search positions; OCR resumes once focused.
                     label = f"BUS ID:{track_id} [AF SCAN]"
                 elif frame_id % OCR_FRAME_INTERVAL == 0:
-                    roi_height, roi_width = roi.shape[:2]
-                    if roi_width < TARGET_OCR_MIN_SIDE or roi_height < TARGET_OCR_MIN_SIDE:
-                        label = f"BUS ID:{track_id} [ROI UPSCALE]"
                     schedule_ocr(track_id, roi, time.monotonic())
 
                 annotations.append(((x1, y1, x2, y2), roi_box, label, (0, 255, 255)))

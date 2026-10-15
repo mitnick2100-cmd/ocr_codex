@@ -1,18 +1,13 @@
-"""Headless IMX519 bus-number recognition: one-shot confirmation, high-resolution ROI without upscaling.
+"""Headless IMX519 bus-number recognition: one-shot confirmation.
 
-One-shot variant of nohead_hires_noup_main.py: the first valid OCR result (1 to
-4 digits) confirms a bus at once, instead of waiting for two identical results
-in a row. Everything else matches nohead_hires_noup_main.py:
-
-Same as nohead_hires_roi_main.py (sign ROI cropped from the --source-width x
---source-height camera frame, YOLO on the --width x --height processing frame;
-defaults here: 3840x2160 source, autofocus --roi-size 0.2),
-except that the ROI is never enlarged before OCR: it goes to Ollama at its
-cropped size, and only ROIs longer than MAX_OCR_SIDE are shrunk. A ROI with a
-side under OLLAMA_MIN_IMAGE_SIDE (32 px, which crashes the qwen3-vl runner) is
-not sent at all and is labelled [ROI TOO SMALL]. OCR log lines carry a
-timestamp, the cropped and sent sizes and the Ollama round-trip time, to compare
-against nohead_hires_roi_main.py.
+One-shot variant of nohead_main.py: the first valid OCR result (1 to 4 digits)
+confirms a bus at once, instead of waiting for two identical results in a row.
+Everything else matches nohead_main.py: the sign ROI is cropped from the
+--source-width x --source-height camera frame (default 3840x2160) while YOLO
+and autofocus (--roi-size default 0.2) use the --width x --height processing
+frame; the ROI is never enlarged (only shrunk past MAX_OCR_SIDE), a ROI with a
+side under 32 px is not sent ([ROI TOO SMALL]), and OCR log lines carry a
+timestamp, the cropped and sent sizes and the Ollama round-trip time.
 
 Meant for running over SSH: results and status lines go to the terminal, and the
 camera controls are single key presses read from that terminal (no Enter needed).
@@ -65,7 +60,7 @@ from ContinuousAutofocus_turbo import (FocusController, RoiMeter,
 # =========================
 # Ollama 設定
 # =========================
-OLLAMA_URL = "http://192.168.0.110:11434/api/chat"
+OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "qwen3-vl:4B-instruct"
 OLLAMA_NUM_CTX = 1024
 
@@ -105,6 +100,9 @@ CLEANUP_INTERVAL_FRAMES = 30
 OCR_FRAME_INTERVAL = 5
 OCR_INTERVAL_SECONDS = 1.0
 OCR_QUEUE_SIZE = 2
+# 看板讀不清楚時，模型會把提示詞的「1 至 4 位數字」照抄成 1234；視同 NONE。
+# 單次確認沒有第二次結果可以糾正，不過濾的話 1234 會直接被確認且不再重讀。
+INVALID_RESULTS = {"1234"}
 
 # 小於 32 px 的圖片會讓 qwen3-vl runner 回 500；此版本不放大，這種 ROI 直接不送 OCR。
 # 高解析度裁切的 ROI 可能超過 1000 px 寬，一律縮到 MAX_OCR_SIDE，
@@ -317,7 +315,7 @@ def is_valid_roi(roi_img: np.ndarray) -> bool:
 def normalize_ocr_result(result: str) -> str | None:
     """只接受 1 至 4 位數字，避免模型說明文字進入投票確認。"""
     compact = re.sub(r"\s+", "", result)
-    if compact.upper() == "NONE":
+    if compact.upper() == "NONE" or compact in INVALID_RESULTS:
         return None
     return compact if re.fullmatch(r"\d{1,4}", compact) else None
 

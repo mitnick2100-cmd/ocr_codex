@@ -73,6 +73,9 @@ OCR_FRAME_INTERVAL = 5
 OCR_INTERVAL_SECONDS = 1.0
 OCR_QUEUE_SIZE = 2
 CONFIRMATIONS_REQUIRED = 2
+# 看板讀不清楚時，模型會把提示詞的「1 至 4 位數字」照抄成 1234；視同 NONE。
+# bus_21 實測：過曝看板依序回傳 1234 -> NONE -> 1234，因 NONE 不重置計數而被確認成 1234。
+INVALID_RESULTS = {"1234"}
 
 # 小於 32 px 的圖片會讓 qwen3-vl runner 回 500；ROI 不放大，這種 ROI 直接不送 OCR。
 # ROI 從高解析度來源影格裁切，可能超過 1000 px 寬，一律縮到 MAX_OCR_SIDE，
@@ -293,7 +296,7 @@ def is_valid_roi(roi_img: np.ndarray) -> bool:
 def normalize_ocr_result(result: str) -> str | None:
     """只接受 1 至 4 位數字，避免模型說明文字進入投票確認。"""
     compact = re.sub(r"\s+", "", result)
-    if compact.upper() == "NONE":
+    if compact.upper() == "NONE" or compact in INVALID_RESULTS:
         return None
     return compact if re.fullmatch(r"\d{1,4}", compact) else None
 

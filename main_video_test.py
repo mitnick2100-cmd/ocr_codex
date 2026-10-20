@@ -15,11 +15,11 @@ from ultralytics import YOLO
 # Ollama 設定
 # =========================
 OLLAMA_URL = "http://192.168.0.110:11434/api/chat"
-MODEL_NAME = "qwen3-vl:4B-instruct"
+MODEL_NAME = "qwen3-vl:2b-instruct"
 # 每次 OCR 只用約 100～320 個 token（提示詞 + 一張 ROI；實測最大 317，為 512x512 的 ROI），2048 已足夠；
 # context 越小 KV cache 越小，Jetson 的 CPU/GPU 共用記憶體較不易吃緊。
 # context 只在模型載入時決定：模型已載入時，請求帶較小的 num_ctx 不會重新載入（Ollama 0.17.7 實測 ps 不變）。
-# 要確實套用新值，先在伺服器執行 ollama stop qwen3-vl:4B-instruct 卸載模型，再啟動本程式。
+# 要確實套用新值，先在伺服器執行 ollama stop qwen3-vl:2b-instruct 卸載模型，再啟動本程式。
 OLLAMA_NUM_CTX = 2048
 
 # =========================
@@ -54,13 +54,13 @@ INVALID_RESULTS = {"1234"}
 STALE_TRACK_FRAMES = 300
 PRUNE_INTERVAL_FRAMES = 100
 
-# 任一邊小於 32 px 的圖片會讓 qwen3-vl runner 當掉（回 500）；小 ROI 放大後送出，大 ROI 縮到 MAX_OCR_SIDE。
+# 小於 32 px 的圖片會讓 qwen3-vl runner 回 500；ROI 不放大，這種 ROI 直接不送 OCR。
+# ROI 從原始影格裁切，高解析度影片的 ROI 可能超過 1000 px 寬，一律縮到 MAX_OCR_SIDE，
+# 否則影像 token 會超過 OLLAMA_NUM_CTX（4K 來源的 ROI 約 2000 個 token）。
 OLLAMA_MIN_IMAGE_SIDE = 32
-TARGET_OCR_MIN_SIDE = 96
 MAX_OCR_SIDE = 512
-MIN_SOURCE_ROI_WIDTH = 4
-MIN_SOURCE_ROI_HEIGHT = 4
-MIN_SOURCE_ROI_AREA = 48
+MIN_SOURCE_ROI_WIDTH = OLLAMA_MIN_IMAGE_SIDE
+MIN_SOURCE_ROI_HEIGHT = OLLAMA_MIN_IMAGE_SIDE
 
 # =========================
 # 共用狀態
@@ -150,11 +150,11 @@ def unsharp_mask(image: np.ndarray, sigma: float = 0.8,
 
 
 def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
-    """在 LAB 的 L 通道依序執行 CLAHE、Gamma 與輕度銳化。
+    """針對 LED 看板做條件式增強，不改變 BGR 色彩通道。
 
-    Gamma 係數由原始 L 通道估算，目標均值 128、範圍 0.55 至 2.5；
-    估算後先執行 CLAHE，再套用 Gamma。a、b 通道保留供色彩重建。
-    不使用雙邊濾波、高光壓縮或獨立高斯平滑。
+    流程：依 LAB-L 曝光狀態選擇 gamma 校正或 CLAHE -> 輕度銳化。
+    不使用雙邊濾波或高光壓縮。正常曝光且對比足夠的影像不會被強制
+    套用 gamma，避免損失數字與背景之間的細節。
     """
     if roi_img is None or roi_img.size == 0:
         raise ValueError("ROI 不可為空")
@@ -165,52 +165,57 @@ def enhance_roi(roi_img: np.ndarray) -> np.ndarray:
     mean_luma = float(luma.mean())
     contrast = float(luma.std())
     white_ratio = overexposed_ratio(luma)
-    gamma_used = auto_gamma(luma, target_mean=128.0)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    luma = clahe.apply(luma)
-    luma = apply_gamma(luma, gamma_used)
+    clahe_used = False
+    gamma_used = None
+
+    if white_ratio >= 0.08 or mean_luma >= 165:
+        strategy = "overexposed"
+        gamma_used = auto_gamma(luma, target_mean=120.0)
+        luma = apply_gamma(luma, gamma_used)
+    elif mean_luma <= 115:
+        strategy = "dark"
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        luma = clahe.apply(luma)
+        gamma_used = auto_gamma(luma, target_mean=142.0)
+        luma = apply_gamma(luma, gamma_used)
+        clahe_used = True
+    elif contrast <= 35:
+        strategy = "low-contrast"
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+        luma = clahe.apply(luma)
+        clahe_used = True
+    else:
+        strategy = "normal"
+
     luma = unsharp_mask(luma)
     enhanced = cv2.cvtColor(cv2.merge((luma, channel_a, channel_b)), cv2.COLOR_LAB2BGR)
+    gamma_text = f"{gamma_used:.2f}" if gamma_used is not None else "None"
     print(
-        f"[enhance_roi] clahe-gamma, mean={mean_luma:.1f}, "
+        f"[enhance_roi] {strategy}, mean={mean_luma:.1f}, "
         f"contrast={contrast:.1f}, white={white_ratio:.1%}, "
-        f"gamma={gamma_used:.2f}, CLAHE=True, target=128"
+        f"gamma={gamma_text}, CLAHE={clahe_used}"
     )
     return enhanced
 
 
-def resize_for_ocr(roi_img: np.ndarray) -> np.ndarray:
-    """等比例縮放 ROI：小圖放大（任一邊 < 32 px 會讓 Ollama runner 當掉），大圖縮到 MAX_OCR_SIDE。
-
-    Ollama 會再把影像縮放成 32 的倍數，未滿 65536 像素的一律放大到約 65536 像素，
-    但大圖不會縮小；不先縮小時，1280x720 的 ROI 會用掉約 880 個影像 token。
-    """
+def shrink_for_ocr(roi_img: np.ndarray) -> np.ndarray:
+    """只縮不放：最長邊超過 MAX_OCR_SIDE 才等比例縮小（控制影像 token），其餘原尺寸送出。"""
     height, width = roi_img.shape[:2]
-    scale = max(
-        1.0,
-        OLLAMA_MIN_IMAGE_SIDE / width,
-        OLLAMA_MIN_IMAGE_SIDE / height,
-        TARGET_OCR_MIN_SIDE / width,
-        TARGET_OCR_MIN_SIDE / height,
-    )
-
-    max_scaled_side = max(width, height) * scale
-    if max_scaled_side > MAX_OCR_SIDE:
-        scale = MAX_OCR_SIDE / max(width, height)
-
-    if scale == 1.0:
+    if max(width, height) <= MAX_OCR_SIDE:
         return roi_img
 
+    scale = MAX_OCR_SIDE / max(width, height)
+    # 看板 ROI 長寬比約 2～6，縮到 512 後短邊仍遠大於 32；max() 只是防極端比例觸發 500
     output_width = max(OLLAMA_MIN_IMAGE_SIDE, round(width * scale))
     output_height = max(OLLAMA_MIN_IMAGE_SIDE, round(height * scale))
     print(
-        f"[resize_for_ocr] {width}x{height} -> "
+        f"[shrink_for_ocr] {width}x{height} -> "
         f"{output_width}x{output_height}, scale={scale:.2f}"
     )
     return cv2.resize(
         roi_img,
         (output_width, output_height),
-        interpolation=cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA,
+        interpolation=cv2.INTER_AREA,
     )
 
 
@@ -238,15 +243,11 @@ def extract_sign_roi(frame: np.ndarray, x1: int, y1: int,
 
 
 def is_valid_roi(roi_img: np.ndarray) -> bool:
-    """只過濾空圖或極端小圖；其餘小 ROI 交給 resize_for_ocr 放大。"""
+    """任一邊小於 32 px 就不送 OCR：ROI 不放大，送出會讓 qwen3-vl runner 回 500。"""
     if roi_img is None or roi_img.size == 0:
         return False
     height, width = roi_img.shape[:2]
-    return (
-        width >= MIN_SOURCE_ROI_WIDTH
-        and height >= MIN_SOURCE_ROI_HEIGHT
-        and width * height >= MIN_SOURCE_ROI_AREA
-    )
+    return width >= MIN_SOURCE_ROI_WIDTH and height >= MIN_SOURCE_ROI_HEIGHT
 
 
 def normalize_ocr_result(result: str) -> str | None:
@@ -261,7 +262,9 @@ def normalize_ocr_result(result: str) -> str | None:
 # OCR worker（受限佇列，避免多台車同時建立大量執行緒）
 # =========================
 def process_ocr(track_id: int, roi_img: np.ndarray):
-    prepared_roi = enhance_roi(resize_for_ocr(roi_img))
+    roi_height, roi_width = roi_img.shape[:2]
+    prepared_roi = enhance_roi(shrink_for_ocr(roi_img))
+    sent_height, sent_width = prepared_roi.shape[:2]
     payload = {
         "model": MODEL_NAME,
         "messages": [
@@ -280,11 +283,14 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
         # 模型預設 temperature=1 會隨機取樣；固定為 0 讓同一張圖得到相同答案，較快湊到連續確認。
         "options": {"num_ctx": OLLAMA_NUM_CTX, "temperature": 0},
     }
+    started = time.monotonic()
     response = ollama_session.post(OLLAMA_URL, json=payload, timeout=60)
     response.raise_for_status()
     raw_result = response.json()["message"]["content"].strip()
     result = normalize_ocr_result(raw_result)
-    print(f"OCR [ID:{track_id}] = {raw_result!r}")
+    print(f"[{time.strftime('%H:%M:%S')}] OCR [ID:{track_id}] = {raw_result!r} "
+          f"| source ROI {roi_width}x{roi_height} -> sent {sent_width}x{sent_height} "
+          f"| {time.monotonic() - started:.2f} s")
 
     if result is None:
         return
@@ -300,7 +306,7 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
         print(f"ID:{track_id} {result} ({history['count']}/{CONFIRMATIONS_REQUIRED})")
         if history["count"] >= CONFIRMATIONS_REQUIRED:
             confirmed_buses[track_id] = result
-            print(f"CONFIRMED [ID:{track_id}] {result}")
+            print(f"[{time.strftime('%H:%M:%S')}] CONFIRMED [ID:{track_id}] {result}")
 
 
 def ocr_worker():
@@ -362,7 +368,7 @@ def crop_source_roi(source_frame: np.ndarray,
     """把顯示畫面座標的 ROI 換算回原始影格再裁切。
 
     高解析度影片（例如 2160x3840）縮成 720x1280 後只剩 1/3 解析度；從原始影格裁切可保留遠處看板的細節，
-    過大的 ROI 之後再由 resize_for_ocr 縮到 MAX_OCR_SIDE。
+    過大的 ROI 之後再由 shrink_for_ocr 縮到 MAX_OCR_SIDE。
     """
     height, width = source_frame.shape[:2]
     *_, scale, offset_x, offset_y = letterbox_params(height, width)
@@ -516,9 +522,6 @@ def main():
             elif not aspect_ratio_min <= aspect_ratio <= aspect_ratio_max:
                 label = f"BUS ID:{track_id} [ANGLE FILTER]"
             elif frame_id % OCR_FRAME_INTERVAL == 0:
-                roi_height, roi_width = roi.shape[:2]
-                if roi_width < TARGET_OCR_MIN_SIDE or roi_height < TARGET_OCR_MIN_SIDE:
-                    label = f"BUS ID:{track_id} [ROI UPSCALE]"
                 schedule_ocr(track_id, roi, time.monotonic())
 
             cv2.putText(

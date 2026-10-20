@@ -61,8 +61,8 @@ from ContinuousAutofocus_turbo import (FocusController, RoiMeter,
 # Ollama 設定
 # =========================
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "qwen3-vl:4B-instruct"
-OLLAMA_NUM_CTX = 1024
+MODEL_NAME = "qwen3-vl:2b-instruct"
+OLLAMA_NUM_CTX = 2048
 
 # =========================
 # GPU / YOLO
@@ -342,7 +342,8 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
         ],
         "stream": False,
         "keep_alive": -1,
-        "options": {"num_ctx": OLLAMA_NUM_CTX},
+        # 模型預設 temperature=1 會隨機取樣（暖機設的 0 不會延續到這裡）；單次確認沒有第二次結果可以糾正，固定為 0 避免隨機讀出錯誤號碼。
+        "options": {"num_ctx": OLLAMA_NUM_CTX, "temperature": 0},
     }
     started = time.monotonic()
     response = ollama_session.post(OLLAMA_URL, json=payload, timeout=60)

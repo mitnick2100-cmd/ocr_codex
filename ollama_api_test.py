@@ -7,7 +7,7 @@ import time
 OLLAMA_URL = "http://192.168.0.110:11434/api/chat"
 
 # 模型名稱
-MODEL_NAME = "qwen3-vl:4B-instruct"
+MODEL_NAME = "qwen3-vl:2b-instruct"
 
 
 def encode_image(image_path):

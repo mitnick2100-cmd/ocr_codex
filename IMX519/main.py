@@ -85,6 +85,15 @@ MAX_OCR_SIDE = 512
 MIN_SOURCE_ROI_WIDTH = OLLAMA_MIN_IMAGE_SIDE
 MIN_SOURCE_ROI_HEIGHT = OLLAMA_MIN_IMAGE_SIDE
 
+# 公車框長寬比（處理畫面座標，寬 / 高）。排隊進站時被前車擋住的後車，框只剩露出的細條，
+# 看板只拍到一半就被辨識（10/22 實測：132 只露出「13」，被確認成 1221）。
+# 兩次確認仍可能連續讀到同樣的錯誤號碼（例如車身車號 3775 連讀兩次就被確認），
+# 所以太窄的框一樣先不送 OCR，等車開到前面、框變寬再辨識。
+# 10/22 錄影：單獨一台的框中位數 1.10，被前車擋住的後車中位數 0.78；
+# 下限 0.8 擋掉約 56% 的後車框，單獨車輛只擋掉約 4%。上限 1.8 過濾側面角度。
+ASPECT_RATIO_MIN = 0.8
+ASPECT_RATIO_MAX = 1.8
+
 # =========================
 # MP4 錄影（--record）
 # =========================
@@ -825,8 +834,6 @@ def main():
 
     frame_id = 0
     processing_size = (args.width, args.height)
-    aspect_ratio_min = 0.0
-    aspect_ratio_max = 1.8
 
     recorder = None
     try:
@@ -893,7 +900,10 @@ def main():
                 aspect_ratio = width / height
                 if not valid_roi:
                     label = f"BUS ID:{track_id} [ROI TOO SMALL]"
-                elif not aspect_ratio_min <= aspect_ratio <= aspect_ratio_max:
+                elif aspect_ratio < ASPECT_RATIO_MIN:
+                    # 框太窄：多半是被前車擋住的後車，看板只露出一部分
+                    label = f"BUS ID:{track_id} [NARROW]"
+                elif aspect_ratio > ASPECT_RATIO_MAX:
                     label = f"BUS ID:{track_id} [ANGLE FILTER]"
                 elif af.scanning:
                     # Lens is moving through search positions; OCR resumes once focused.

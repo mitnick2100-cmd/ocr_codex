@@ -539,6 +539,10 @@ def parse_args():
                         help="Camera output height. Default: 2160")
     parser.add_argument("--framerate", type=int, choices=FPS_OPTIONS, default=17,
                         help="IMX519 FPS. Supported: 9, 15, 17, 60, 120")
+    parser.add_argument("--flip", type=int, choices=range(8), default=0, metavar="0-7",
+                        help="Rotate / mirror the camera image in hardware (nvvidconv flip-method): "
+                             "0 none, 2 rotate 180 (camera mounted upside down), "
+                             "4 mirror left-right, 6 mirror top-bottom. Default: 0")
     parser.add_argument("--exposure", type=float, default=None,
                         help="Fixed exposure time in ms; default is auto exposure")
     parser.add_argument("--gain", default="1 1",
@@ -1012,6 +1016,7 @@ def main():
         ae_lock=exposure_ms is not None,
         capture_width=capture_width,
         capture_height=capture_height,
+        flip_method=args.flip,
     )
 
     focuser = Focuser(args.i2c_bus)

@@ -154,24 +154,27 @@ class Camera(object):
 
     def __init__(self, width=1280, height=720,
                  framerate=15, exposure_time_ns=None, gain_range=None, ae_lock=False,
-                 capture_width=3840, capture_height=2160):
+                 capture_width=3840, capture_height=2160, flip_method=0):
         self.open_camera(width, height, framerate, exposure_time_ns, gain_range,
-                         ae_lock, capture_width, capture_height)
+                         ae_lock, capture_width, capture_height, flip_method)
 
     def open_camera(self, width=1280, height=720,
                     framerate=15, exposure_time_ns=None, gain_range=None, ae_lock=False,
-                    capture_width=3840, capture_height=2160):
+                    capture_width=3840, capture_height=2160, flip_method=0):
+        """flip_method 交給 nvvidconv 用硬體轉向：0 不轉、2 旋轉 180 度（鏡頭倒裝）、
+        4 左右鏡像、6 上下鏡像、1 / 3 逆 / 順時針 90 度。"""
         self._width = width
         self._height = height
         self._framerate = framerate
         self._capture_width = capture_width
         self._capture_height = capture_height
+        self._flip_method = flip_method
 
         self.cap = cv2.VideoCapture(
             gstreamer_pipeline(
                 capture_width=capture_width,
                 capture_height=capture_height,
-                flip_method=0,
+                flip_method=flip_method,
                 display_width=width,
                 display_height=height,
                 framerate=framerate,
@@ -211,7 +214,8 @@ class Camera(object):
                 gstreamer_pipeline(
                     capture_width=capture_width,
                     capture_height=capture_height,
-                    flip_method=0,
+                    # 重開相機時沿用開啟時的轉向，避免調整 FPS / 曝光後畫面轉回來
+                    flip_method=self._flip_method,
                     display_width=self._width,
                     display_height=self._height,
                     framerate=framerate,

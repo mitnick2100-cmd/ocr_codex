@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """IMX519 / Jetson continuous autofocus (turbo-only, no fine scan).
 
-Run beside JetsonCamera.py and Focuser.py. Fixed central ROI, not object
-tracking. Motion gating is a heuristic, not a motion/defocus classifier.
+Run beside JetsonCamera.py and Focuser.py. Fixed ROI (frame centre by default,
+moved with --roi-x / --roi-y), not object tracking. Motion gating is a
+heuristic, not a motion/defocus classifier.
 
 Trigger: the smoothed ROI score drops below reference x drop-ratio, or rises
 above reference x rise-ratio (new / more textured target). In NO TARGET
@@ -99,7 +100,10 @@ def roi_sharpness(frame, args):
     """Return (Tenengrad score, mean brightness, small blurred ROI, ROI rectangle)."""
     h, w = frame.shape[:2]
     rw, rh = int(w * args.roi_size), int(h * args.roi_size)
-    x, y = (w - rw) // 2, (h - rh) // 2
+    # 中央位置再依 --roi-x / --roi-y（畫面寬 / 高的比例，負值往左 / 往上）平移，並限制在畫面內
+    x = (w - rw) // 2 + round(w * getattr(args, "roi_x", 0.0))
+    y = (h - rh) // 2 + round(h * getattr(args, "roi_y", 0.0))
+    x, y = min(max(x, 0), w - rw), min(max(y, 0), h - rh)
     gray = cv2.cvtColor(frame[y:y+rh, x:x+rw], cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, (320, 180))
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -421,7 +425,7 @@ class FocusController:
 
     def _monitor(self, now, score):
         self.state = "MONITOR"
-        self.reason = "Monitoring central ROI"
+        self.reason = "Monitoring ROI"
         if self.stable_since is None:
             self.stable_since = now
         self.history.append((score, self.brightness))
@@ -585,7 +589,13 @@ def calibrate(camera, focuser, args):
 
 def add_af_arguments(parser):
     """Autofocus options shared by this script and ollama_camera_V12.py."""
-    parser.add_argument("--roi-size", type=float, default=0.3, help="Central ROI fraction")
+    parser.add_argument("--roi-size", type=float, default=0.3, help="ROI size, fraction of the frame")
+    parser.add_argument("--roi-x", type=float, default=0.0,
+                        help="Shift the ROI from the frame centre, fraction of the frame width "
+                             "(negative = left)")
+    parser.add_argument("--roi-y", type=float, default=0.0,
+                        help="Shift the ROI from the frame centre, fraction of the frame height "
+                             "(negative = up)")
     parser.add_argument("--drop-ratio", type=float, default=0.9,
                         help="Refocus when score < reference x drop-ratio")
     parser.add_argument("--rise-ratio", type=float, default=1.4,
@@ -612,6 +622,10 @@ def add_af_arguments(parser):
 def check_af_args(parser, args):
     if not 0.05 <= args.roi_size <= 0.9 or not 0 < args.drop_ratio < 1:
         parser.error("roi-size must be 0.05..0.9; drop-ratio must be 0..1")
+    max_shift = (1 - args.roi_size) / 2
+    if abs(args.roi_x) > max_shift or abs(args.roi_y) > max_shift:
+        parser.error("roi-x / roi-y must keep the ROI inside the frame: "
+                     "|shift| <= {:.2f} for roi-size {}".format(max_shift, args.roi_size))
     if args.rise_ratio <= 1:
         parser.error("rise-ratio must be > 1")
     if min(args.trigger_delay, args.cooldown, args.settle,

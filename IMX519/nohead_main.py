@@ -566,8 +566,9 @@ def parse_args():
                         help="MP4 frame rate; default: camera FPS, at most "
                              f"{RECORD_DEFAULT_MAX_FPS}")
     add_af_arguments(parser)
-    # 對焦 ROI 預設改為畫面中央 20%（共用模組 ContinuousAutofocus_turbo 的預設 0.3 不變）
-    parser.set_defaults(roi_size=0.2)
+    # 對焦 ROI 預設為畫面 20%，從中央往左 0.1、往上 0.1（中心在 (0.4, 0.4)，1280x720 為 x 384～640、y 216～360）；
+    # 共用模組 ContinuousAutofocus_turbo 的預設（中央 30%）不變
+    parser.set_defaults(roi_size=0.2, roi_x=-0.1, roi_y=-0.1)
     args = parser.parse_args()
     check_af_args(parser, args)
     if args.status_interval < 0:

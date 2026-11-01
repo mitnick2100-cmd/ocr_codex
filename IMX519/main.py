@@ -72,9 +72,8 @@ CLEANUP_INTERVAL_FRAMES = 30
 OCR_FRAME_INTERVAL = 5
 OCR_INTERVAL_SECONDS = 1.0
 OCR_QUEUE_SIZE = 2
-CONFIRMATIONS_REQUIRED = 2
 # 看板讀不清楚時，模型會把提示詞的「1 至 4 位數字」照抄成 1234；視同 NONE。
-# bus_21 實測：過曝看板依序回傳 1234 -> NONE -> 1234，因 NONE 不重置計數而被確認成 1234。
+# 單次確認沒有第二次結果可以糾正，不過濾的話 1234 會直接被確認且不再重讀。
 INVALID_RESULTS = {"1234"}
 
 # 小於 32 px 的圖片會讓 qwen3-vl runner 回 500；ROI 不放大，這種 ROI 直接不送 OCR。
@@ -87,8 +86,7 @@ MIN_SOURCE_ROI_HEIGHT = OLLAMA_MIN_IMAGE_SIDE
 
 # 公車框長寬比（處理畫面座標，寬 / 高）。排隊進站時被前車擋住的後車，框只剩露出的細條，
 # 看板只拍到一半就被辨識（10/22 實測：132 只露出「13」，被確認成 1221）。
-# 兩次確認仍可能連續讀到同樣的錯誤號碼（例如車身車號 3775 連讀兩次就被確認），
-# 所以太窄的框一樣先不送 OCR，等車開到前面、框變寬再辨識。
+# 單次確認沒有第二次結果可以糾正，太窄的框先不送 OCR，等車開到前面、框變寬再辨識。
 # 10/22 錄影：單獨一台的框中位數 1.10，被前車擋住的後車中位數 0.78；
 # 下限 0.8 擋掉約 56% 的後車框，單獨車輛只擋掉約 4%。上限 1.8 過濾側面角度。
 ASPECT_RATIO_MIN = 0.8
@@ -107,7 +105,6 @@ RECORD_MAX_STALL = 2.0      # seconds a frozen camera (e.g. reopening) is shown 
 confirmed_buses = {}
 last_seen_frame = {}
 last_ocr_time = {}
-ocr_history = {}
 ocr_pending_ids = set()
 ocr_queue = Queue(maxsize=OCR_QUEUE_SIZE)
 lock = threading.Lock()
@@ -332,7 +329,7 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
         ],
         "stream": False,
         "keep_alive": -1,
-        # 模型預設 temperature=1 會隨機取樣（暖機設的 0 不會延續到這裡）；固定為 0 讓同一張圖得到相同答案，較快湊到連續確認。
+        # 模型預設 temperature=1 會隨機取樣（暖機設的 0 不會延續到這裡）；單次確認沒有第二次結果可以糾正，固定為 0 避免隨機讀出錯誤號碼。
         "options": {"num_ctx": OLLAMA_NUM_CTX, "temperature": 0},
     }
     started = time.monotonic()
@@ -347,18 +344,10 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
     if result is None:
         return
 
+    # 一次有效結果就確認；確認後主迴圈不再為這個 ID 排 OCR。
     with lock:
-        history = ocr_history.get(track_id)
-        if history and history["last"] == result:
-            history["count"] += 1
-        else:
-            history = {"last": result, "count": 1}
-            ocr_history[track_id] = history
-
-        print(f"ID:{track_id} {result} ({history['count']}/{CONFIRMATIONS_REQUIRED})")
-        if history["count"] >= CONFIRMATIONS_REQUIRED:
-            confirmed_buses[track_id] = result
-            print(f"[{time.strftime('%H:%M:%S')}] CONFIRMED [ID:{track_id}] {result}")
+        confirmed_buses[track_id] = result
+    print(f"[{time.strftime('%H:%M:%S')}] CONFIRMED [ID:{track_id}] {result}")
 
 
 def ocr_worker():
@@ -448,7 +437,6 @@ def forget_stale_tracks(frame_id: int) -> None:
         for track_id in stale:
             del last_seen_frame[track_id]
             confirmed_buses.pop(track_id, None)
-            ocr_history.pop(track_id, None)
             last_ocr_time.pop(track_id, None)
     if stale:
         print(f"Forgot {len(stale)} stale track(s): {stale}")
@@ -500,7 +488,8 @@ class ContinuousAF:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="V12 YOLO + Ollama OCR using Jetson IMX519 camera."
+        description="V12 YOLO + Ollama OCR using Jetson IMX519 camera "
+                    "(confirmed after one OCR result)."
     )
     parser.add_argument("--width", type=int, default=1280,
                         help="Preview width. Default: 1280")

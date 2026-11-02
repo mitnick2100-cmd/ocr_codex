@@ -89,7 +89,10 @@ MIN_SOURCE_ROI_HEIGHT = OLLAMA_MIN_IMAGE_SIDE
 # 單次確認沒有第二次結果可以糾正，太窄的框先不送 OCR，等車開到前面、框變寬再辨識。
 # 10/22 錄影：單獨一台的框中位數 1.10，被前車擋住的後車中位數 0.78；
 # 下限 0.8 擋掉約 56% 的後車框，單獨車輛只擋掉約 4%。上限 1.8 過濾側面角度。
-ASPECT_RATIO_MIN = 0.8
+# 10/28 錄影（鏡頭和公車道幾乎同一直線）：108 單獨正面駛來、看板完整時只有 0.54～0.79，
+# 被 0.8 誤擋約 1.9 秒；被 12 號擋住時 0.42～0.51（0.51 那幾幀看板已完整，放行無妨），下限改為 0.5。
+# 長寬比會隨架設角度改變，換位置要重新量。
+ASPECT_RATIO_MIN = 0.5
 ASPECT_RATIO_MAX = 1.8
 
 # =========================
@@ -368,13 +371,13 @@ def ocr_worker():
 # =========================
 # YOLO detection
 # =========================
-def detect_bus(frame):
+def detect_bus(frame, conf: float):
     results = model.track(
         frame,
         imgsz=(768, 1280),
         device=device,
         classes=[5],
-        conf=0.5,
+        conf=conf,
         half=half,
         persist=True,
         verbose=False,
@@ -516,6 +519,8 @@ def parse_args():
                         help="YOLO model path; default searches this folder and its parent")
     parser.add_argument("--device", default=None,
                         help="Inference device, e.g. 0, cpu; default auto")
+    parser.add_argument("--conf", type=float, default=0.5,
+                        help="YOLO bus confidence threshold, 0 to 1. Default: 0.5")
     parser.add_argument("--no-af", action="store_true",
                         help="Start in manual focus; F / Enter enables continuous AF")
     parser.add_argument("--record", nargs="?", const="", default=None, metavar="FILE",
@@ -530,6 +535,8 @@ def parse_args():
     parser.set_defaults(roi_size=0.2, roi_x=-0.1, roi_y=-0.1)
     args = parser.parse_args()
     check_af_args(parser, args)
+    if not 0 < args.conf < 1:
+        parser.error("--conf must be between 0 and 1")
     if args.record_fps is not None and args.record_fps <= 0:
         parser.error("--record-fps must be > 0")
     if args.source_width < args.width or args.source_height < args.height:
@@ -854,7 +861,7 @@ def main():
             af.update(frame, time.monotonic())
             # Draw only on a copy: `frame` stays clean for AF and YOLO.
             display = frame.copy()
-            buses = detect_bus(frame)
+            buses = detect_bus(frame, args.conf)
             current_ids = {bus[5] for bus in buses}
 
             with lock:

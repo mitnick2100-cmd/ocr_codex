@@ -26,7 +26,6 @@ import signal
 import sys
 import threading
 import time
-from collections import deque
 from queue import Empty, Full, Queue
 from pathlib import Path
 
@@ -651,7 +650,6 @@ def adjust_exposure(camera, cam_state, focuser, delta_ms):
 
 
 SNAPSHOT_PATH = "v12_image.jpg"
-FPS_WINDOW_FRAMES = 30
 RECORD_DEFAULT_MAX_FPS = 30
 RECORD_QUEUE_SIZE = 16      # annotated frames waiting for the encoder (~2.7 MB each at 720p)
 RECORD_MAX_STALL = 2.0      # seconds a frozen camera (e.g. reopening) is shown in the video
@@ -793,20 +791,13 @@ def print_control_status(cam_state, focuser, af):
     print("    " + " | ".join(control_status(cam_state, focuser, af)))
 
 
-def print_status(fps, bus_text, annotations, cam_state, focuser, af, recorder=None):
-    in_frame = ", ".join(label for _, _, label, _ in annotations) or "-"
-    print(f"[{time.strftime('%H:%M:%S')}] {fps:.1f} FPS | BUS NUMBER: {bus_text} "
-          f"| in frame: {in_frame}")
-    print_control_status(cam_state, focuser, af)
-    if recorder is not None:
-        print(f"    REC {recorder.path.name} | {recorder.seconds:.0f} s "
-              f"| dropped {recorder.dropped}")
-
-
-def measured_fps(frame_times):
-    if len(frame_times) < 2 or frame_times[-1] <= frame_times[0]:
-        return 0.0
-    return (len(frame_times) - 1) / (frame_times[-1] - frame_times[0])
+def print_status(annotations, cam_state, af):
+    """定期狀態只留一行：畫面中的公車框、曝光、AF 狀態（完整相機資訊見 print_control_status）。"""
+    buses = ", ".join(label.removeprefix("BUS ") for _, _, label, _ in annotations) or "-"
+    exposure_ms = cam_state["exposure_ms"]
+    exposure_text = "Auto" if exposure_ms is None else f"{exposure_ms:.2f} ms"
+    af_text = af.controller.state if af.enabled else "MANUAL"
+    print(f"[{time.strftime('%H:%M:%S')}] Bus: {buses} | Exposure: {exposure_text} | AF: {af_text}")
 
 
 def render_display(frame, annotations, bus_text, cam_state, focuser, af):
@@ -1027,7 +1018,6 @@ def main():
     frame_id = 0
     processing_size = (args.width, args.height)
     bus_text = None
-    frame_times = deque(maxlen=FPS_WINDOW_FRAMES)
     status_time = time.monotonic()
 
     keys = TerminalKeys(enabled=not args.no_keys)
@@ -1057,7 +1047,6 @@ def main():
 
             frame_id += 1
             frame_time = time.monotonic()
-            frame_times.append(frame_time)
             # YOLO / AF / 畫面輸出用縮小的處理畫面；看板 ROI 之後從 source_frame 裁切
             frame = cv2.resize(source_frame, processing_size, interpolation=cv2.INTER_AREA)
             af.update(frame, time.monotonic())
@@ -1120,8 +1109,7 @@ def main():
 
             now = time.monotonic()
             if args.status_interval and now - status_time >= args.status_interval:
-                print_status(measured_fps(frame_times), bus_text, annotations,
-                             cam_state, focuser, af, recorder)
+                print_status(annotations, cam_state, af)
                 status_time = now
 
             for key in keys.poll():
@@ -1130,8 +1118,7 @@ def main():
                 if key in ("h", "H", "?"):
                     print(HELP_TEXT)
                 elif key in ("p", "P", " "):
-                    print_status(measured_fps(frame_times), bus_text, annotations,
-                                 cam_state, focuser, af, recorder)
+                    print_status(annotations, cam_state, af)
                 elif key in ("c", "C"):
                     save_snapshot(render_display(frame, annotations, bus_text,
                                                  cam_state, focuser, af))

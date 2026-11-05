@@ -21,6 +21,7 @@ if IMX519_DIR.exists():
 
 from JetsonCamera import Camera
 from Focuser import Focuser
+import daynight
 from ContinuousAutofocus_turbo import (FocusController, RoiMeter,
                                        add_af_arguments, check_af_args)
 
@@ -60,6 +61,9 @@ KEY_LEFT = (2424832, 65361, 81)
 KEY_UP = (2490368, 65362, 82)
 KEY_RIGHT = (2555904, 65363, 83)
 KEY_DOWN = (2621440, 65364, 84)
+# Keys that reopen the camera (or change exposure): they would skew the startup
+# day / night measurement, so pressing one during it cancels the detection.
+REOPEN_KEY_CODES = {ord(c) for c in "-_=+{}[]aA"}
 
 # =========================
 # 執行參數
@@ -510,9 +514,12 @@ def parse_args():
                              "0 none, 2 rotate 180 (camera mounted upside down), "
                              "4 mirror left-right, 6 mirror top-bottom. Default: 0")
     parser.add_argument("--exposure", type=float, default=None,
-                        help="Fixed exposure time in ms; default is auto exposure")
+                        help="Fixed exposure time in ms; default is auto exposure "
+                             f"({daynight.REFERENCE_EXPOSURE_MS:g} ms with day / night detection)")
     parser.add_argument("--gain", default="1 1",
-                        help='Fixed gain range, e.g. "1 1"; use "" for auto gain')
+                        help='Fixed gain range, e.g. "1 1"; use "" for auto gain. '
+                             "Only used with --no-auto-daynight")
+    daynight.add_arguments(parser)
     parser.add_argument("-i", "--i2c-bus", type=int, default=10,
                         help="Focuser I2C bus. Default: 10")
     parser.add_argument("--model", default=None,
@@ -520,7 +527,8 @@ def parse_args():
     parser.add_argument("--device", default=None,
                         help="Inference device, e.g. 0, cpu; default auto")
     parser.add_argument("--conf", type=float, default=0.5,
-                        help="YOLO bus confidence threshold, 0 to 1. Default: 0.5")
+                        help="YOLO bus confidence threshold, 0 to 1. Default: 0.5. "
+                             "Only used with --no-auto-daynight")
     parser.add_argument("--no-af", action="store_true",
                         help="Start in manual focus; F / Enter enables continuous AF")
     parser.add_argument("--record", nargs="?", const="", default=None, metavar="FILE",
@@ -537,6 +545,7 @@ def parse_args():
     check_af_args(parser, args)
     if not 0 < args.conf < 1:
         parser.error("--conf must be between 0 and 1")
+    daynight.check_args(args)
     if args.record_fps is not None and args.record_fps <= 0:
         parser.error("--record-fps must be > 0")
     if args.source_width < args.width or args.source_height < args.height:
@@ -640,6 +649,7 @@ def draw_control_overlay(frame, cam_state, focuser, af):
     lines = [
         "Focus: {} | {}".format(focus, autofocus_text),
         exposure_text,
+        daynight.mode_text(cam_state),
         "Camera: {} FPS ({}x{})".format(
             cam_state["framerate"],
             cam_state["capture_width"],
@@ -793,17 +803,18 @@ def main():
     args = parse_args()
     model_path = resolve_model_path(args.model)
     inference_device = args.device or device
-    gain_range = args.gain if args.gain else None
     capture_width, capture_height = SENSOR_MODES[args.framerate]
     exposure_ms = clamp_exposure_ms(args.exposure, args.framerate)
     exposure_ns = int(exposure_ms * 1_000_000) if exposure_ms is not None else None
     cam_state = {
         "framerate": args.framerate,
         "exposure_ms": exposure_ms,
-        "gain_range": gain_range,
         "capture_width": capture_width,
         "capture_height": capture_height,
+        # gain_range / conf / mode / probe: day profile + startup probe, or --gain / --conf
+        **daynight.initial_state(args, exposure_ms),
     }
+    gain_range = cam_state["gain_range"]
 
     print(
         "Opening IMX519: source {}x{} (OCR ROI), preview {}x{} (YOLO) "
@@ -826,6 +837,12 @@ def main():
 
     focuser = Focuser(args.i2c_bus)
     af = ContinuousAF(focuser, args)
+
+    def reopen_for_profile():
+        """Reopen with cam_state's gain for a day / night profile (raises RuntimeError on failure)."""
+        reopen_camera_with_exposure(camera, cam_state, focuser)
+        # New pipeline, new gain: the old search state and motion frame are stale.
+        af.restart(AF_REOPEN_WARMUP)
 
     model = YOLO(model_path)
     device = inference_device
@@ -859,9 +876,11 @@ def main():
             # YOLO / AF / 視窗用縮小的處理畫面；看板 ROI 之後從 source_frame 裁切
             frame = cv2.resize(source_frame, processing_size, interpolation=cv2.INTER_AREA)
             af.update(frame, time.monotonic())
+            # 開機日夜判斷：量乾淨的處理畫面（畫框、文字之前），收滿 10 秒才套用結果
+            daynight.startup_step(cam_state, frame, frame_time, reopen_for_profile)
             # Draw only on a copy: `frame` stays clean for AF and YOLO.
             display = frame.copy()
-            buses = detect_bus(frame, args.conf)
+            buses = detect_bus(frame, cam_state["conf"])
             current_ids = {bus[5] for bus in buses}
 
             with lock:
@@ -945,6 +964,9 @@ def main():
                 continue
             if key == 27 or (key & 0xFF) in (ord("q"), ord("Q")):
                 break
+            if (key & 0xFF) in REOPEN_KEY_CODES or key in KEY_LEFT or key in KEY_RIGHT:
+                # 手動改曝光 / FPS 會讓量到的亮度失準：以使用者的設定為準，維持白天參數
+                daynight.cancel_startup(cam_state, reopen_for_profile)
             handle_camera_key(key, camera, cam_state, focuser, af, display)
     finally:
         if recorder is not None:

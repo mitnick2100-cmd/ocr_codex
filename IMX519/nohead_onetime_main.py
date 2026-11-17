@@ -19,6 +19,14 @@ night profile (gain 3, conf 0.3); afterwards nothing is re-checked, so restart
 the program across dusk / dawn. --no-auto-daynight restores the manual
 --gain / --conf behaviour; a manual exposure / FPS key during the 10 s cancels it.
 
+Voice (voice.py): each CONFIRMED bus number is announced in Mandarin through the
+default PulseAudio output ("5號公車即將進站") by piper running in the background, so
+recognition never waits for speech. Numbers with 3 or 4 digits are read digit
+by digit; the same number is not announced again within --voice-cooldown
+seconds (default 30), which also covers a bus that ByteTrack gives a new ID. Announcements are queued
+and played one at a time; [VOICE] log lines mark each one. Any voice failure
+only prints a warning. --no-voice turns it off.
+
 Meant for running over SSH: results and status lines go to the terminal, and the
 camera controls are single key presses read from that terminal (no Enter needed).
 Press C to save an annotated snapshot when you need to see the picture, or run
@@ -64,6 +72,7 @@ if IMX519_DIR.exists():
 from JetsonCamera import Camera
 from Focuser import Focuser
 import daynight
+import voice
 from ContinuousAutofocus_turbo import (FocusController, RoiMeter,
                                        add_af_arguments, check_af_args)
 
@@ -142,6 +151,7 @@ last_ocr_time = {}
 ocr_pending_ids = set()
 ocr_queue = Queue(maxsize=OCR_QUEUE_SIZE)
 lock = threading.Lock()
+announcer = None  # voice.VoiceAnnouncer；main() 建立，OCR worker 確認號碼後呼叫 announce()
 ollama_session = requests.Session()
 ollama_session.trust_env = False
 
@@ -382,6 +392,9 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
     with lock:
         confirmed_buses[track_id] = result
     print(f"[{time.strftime('%H:%M:%S')}] CONFIRMED [ID:{track_id}] {result}")
+    # 只在 CONFIRMED 播報：主迴圈的 bus_text 會出現 NONE、"5,12"，車被擋住時還會反覆跳動
+    if announcer is not None:
+        announcer.announce(result)
 
 
 def ocr_worker():
@@ -547,6 +560,7 @@ def parse_args():
                         help='Fixed gain range, e.g. "1 1"; use "" for auto gain. '
                              "Only used with --no-auto-daynight")
     daynight.add_arguments(parser)
+    voice.add_arguments(parser)
     parser.add_argument("-i", "--i2c-bus", type=int, default=10,
                         help="Focuser I2C bus. Default: 10")
     parser.add_argument("--model", default=None,
@@ -577,6 +591,7 @@ def parse_args():
     if not 0 < args.conf < 1:
         parser.error("--conf must be between 0 and 1")
     daynight.check_args(args)
+    voice.check_args(args)
     if args.status_interval < 0:
         parser.error("--status-interval must be >= 0")
     if args.record_fps is not None and args.record_fps <= 0:
@@ -980,7 +995,7 @@ def handle_camera_key(key, camera, cam_state, focuser, af):
 
 
 def main():
-    global model, half, device
+    global model, half, device, announcer
 
     # Line buffered, so `| tee run.log` or `> run.log` + `tail -f` shows output at once.
     sys.stdout.reconfigure(line_buffering=True)
@@ -1039,6 +1054,8 @@ def main():
     half = inference_device == "cuda"
 
     warmup_ollama()
+    # 在 OCR worker 啟動前建立，第一個 CONFIRMED 就能播報；piper 在背景載入模型（約 0.4 s）
+    announcer = voice.VoiceAnnouncer(args)
     threading.Thread(target=ocr_worker, daemon=True, name="ollama-ocr-worker").start()
 
     frame_id = 0
@@ -1162,6 +1179,8 @@ def main():
         # Finalise the MP4 first: printing can fail once an SSH terminal is gone.
         if recorder is not None:
             recorder.close()
+        # 中斷正在播的句子並結束 piper，不等佇列播完
+        announcer.close()
         camera.close()
         keys.restore()
         if recorder is not None:

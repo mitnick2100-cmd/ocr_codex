@@ -19,13 +19,19 @@ night profile (gain 3, conf 0.3); afterwards nothing is re-checked, so restart
 the program across dusk / dawn. --no-auto-daynight restores the manual
 --gain / --conf behaviour; a manual exposure / FPS key during the 10 s cancels it.
 
-Voice (voice.py): each CONFIRMED bus number is announced in Mandarin through the
-default PulseAudio output ("5號公車即將進站") by piper running in the background, so
-recognition never waits for speech. Numbers with 3 or 4 digits are read digit
-by digit; the same number is not announced again within --voice-cooldown
-seconds (default 30), which also covers a bus that ByteTrack gives a new ID. Announcements are queued
-and played one at a time; [VOICE] log lines mark each one. Any voice failure
-only prints a warning. --no-voice turns it off.
+Voice (voice.py): each CONFIRMED bus is announced in Mandarin through the
+default PulseAudio output by piper running in the background, so recognition
+never waits for speech. Buses confirmed within --voice-merge s (0.8) are
+announced together, front bus first, one sentence each ("前車12號公車即將進站",
+then "後車5號公車即將進站"; the front bus is the one further right,
+--voice-front); a bus that has left by then is skipped. Each track ID is
+announced once; the same number again is a second bus (announced the same way)
+while the earlier one is still in view elsewhere, or an ID switch (not
+announced) when it appears near where the earlier one was within
+--voice-switch-window s (5). Numbers with 3 or 4 digits are read digit
+by digit; --voice-speed 1.25 is 25% slower than piper's normal speed.
+Sentences never interrupt each other; [VOICE] log lines mark each one. Any voice
+failure only prints a warning. --no-voice turns it off.
 
 Meant for running over SSH: results and status lines go to the terminal, and the
 camera controls are single key presses read from that terminal (no Enter needed).
@@ -147,6 +153,12 @@ ASPECT_RATIO_MAX = 1.8
 # =========================
 confirmed_buses = {}
 last_seen_frame = {}
+# 語音排隊播報用（voice.py 透過 get_tracks 讀取）：最後 / 第一次出現的框（處理畫面座標）與 monotonic 時間
+last_box = {}
+last_seen_time = {}
+first_box = {}
+first_seen_time = {}
+latest_frame_id = 0
 last_ocr_time = {}
 ocr_pending_ids = set()
 ocr_queue = Queue(maxsize=OCR_QUEUE_SIZE)
@@ -394,7 +406,7 @@ def process_ocr(track_id: int, roi_img: np.ndarray):
     print(f"[{time.strftime('%H:%M:%S')}] CONFIRMED [ID:{track_id}] {result}")
     # 只在 CONFIRMED 播報：主迴圈的 bus_text 會出現 NONE、"5,12"，車被擋住時還會反覆跳動
     if announcer is not None:
-        announcer.announce(result)
+        announcer.announce(track_id, result)
 
 
 def ocr_worker():
@@ -469,6 +481,23 @@ def get_visible_results(frame_id: int) -> list[str]:
         return [confirmed_buses[track_id] for track_id in sorted(visible_ids)]
 
 
+def get_tracks() -> dict:
+    """給 voice.VoiceAnnouncer：{track_id: voice.Track(是否在畫面中, 最後的框, 最後被看到幾秒前,
+    第一次出現的框, 第一次出現幾秒前)}。
+
+    「在畫面中」與 get_visible_results 相同：最近 GRACE_FRAMES 幀內出現過（相機重開、沒有新幀時維持原狀）。
+    消失秒數用 time.monotonic() 記錄，不用幀數換算：FPS 會隨 YOLO 負載變動。
+    """
+    now = time.monotonic()
+    with lock:
+        return {
+            track_id: voice.Track(latest_frame_id - last_seen_frame[track_id] <= GRACE_FRAMES,
+                                  box, now - last_seen_time[track_id],
+                                  first_box[track_id], now - first_seen_time[track_id])
+            for track_id, box in last_box.items()
+        }
+
+
 def forget_stale_tracks(frame_id: int) -> None:
     """清除超過 FORGET_FRAMES 沒出現的 ID，讓共用字典不會隨執行時間無限增長。
 
@@ -485,6 +514,10 @@ def forget_stale_tracks(frame_id: int) -> None:
             del last_seen_frame[track_id]
             confirmed_buses.pop(track_id, None)
             last_ocr_time.pop(track_id, None)
+            last_box.pop(track_id, None)
+            last_seen_time.pop(track_id, None)
+            first_box.pop(track_id, None)
+            first_seen_time.pop(track_id, None)
     if stale:
         print(f"Forgot {len(stale)} stale track(s): {stale}")
 
@@ -549,10 +582,11 @@ def parse_args():
                         help="Camera output height. Default: 2160")
     parser.add_argument("--framerate", type=int, choices=FPS_OPTIONS, default=17,
                         help="IMX519 FPS. Supported: 9, 15, 17, 60, 120")
-    parser.add_argument("--flip", type=int, choices=range(8), default=0, metavar="0-7",
+    # 鏡頭倒裝，實際執行一律用 2（旋轉 180 度）
+    parser.add_argument("--flip", type=int, choices=range(8), default=2, metavar="0-7",
                         help="Rotate / mirror the camera image in hardware (nvvidconv flip-method): "
                              "0 none, 2 rotate 180 (camera mounted upside down), "
-                             "4 mirror left-right, 6 mirror top-bottom. Default: 0")
+                             "4 mirror left-right, 6 mirror top-bottom. Default: 2")
     parser.add_argument("--exposure", type=float, default=None,
                         help="Fixed exposure time in ms; default is auto exposure "
                              f"({daynight.REFERENCE_EXPOSURE_MS:g} ms with day / night detection)")
@@ -995,7 +1029,7 @@ def handle_camera_key(key, camera, cam_state, focuser, af):
 
 
 def main():
-    global model, half, device, announcer
+    global model, half, device, announcer, latest_frame_id
 
     # Line buffered, so `| tee run.log` or `> run.log` + `tail -f` shows output at once.
     sys.stdout.reconfigure(line_buffering=True)
@@ -1055,7 +1089,7 @@ def main():
 
     warmup_ollama()
     # 在 OCR worker 啟動前建立，第一個 CONFIRMED 就能播報；piper 在背景載入模型（約 0.4 s）
-    announcer = voice.VoiceAnnouncer(args)
+    announcer = voice.VoiceAnnouncer(args, get_tracks)
     threading.Thread(target=ocr_worker, daemon=True, name="ollama-ocr-worker").start()
 
     frame_id = 0
@@ -1096,11 +1130,16 @@ def main():
             # 開機日夜判斷：量乾淨的處理畫面（畫框、文字之前），收滿 10 秒才套用結果
             daynight.startup_step(cam_state, frame, frame_time, reopen_for_profile)
             buses = detect_bus(frame, cam_state["conf"])
-            current_ids = {bus[5] for bus in buses}
 
             with lock:
-                for track_id in current_ids:
+                latest_frame_id = frame_id
+                for x1, y1, x2, y2, _, track_id in buses:
                     last_seen_frame[track_id] = frame_id
+                    last_seen_time[track_id] = frame_time
+                    last_box[track_id] = (x1, y1, x2, y2)
+                    if track_id not in first_box:
+                        first_box[track_id] = last_box[track_id]
+                        first_seen_time[track_id] = frame_time
             if frame_id % CLEANUP_INTERVAL_FRAMES == 0:
                 forget_stale_tracks(frame_id)
 

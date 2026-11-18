@@ -616,6 +616,9 @@ def parse_args():
     parser.add_argument("--record-fps", type=float, default=None,
                         help="MP4 frame rate; default: camera FPS, at most "
                              f"{RECORD_DEFAULT_MAX_FPS}")
+    parser.add_argument("--no-overlay", action="store_true",
+                        help="Snapshots / MP4 without text or the AF box "
+                             "(bus and sign boxes are still drawn)")
     add_af_arguments(parser)
     # 對焦 ROI 預設為畫面 20%，從中央往左 0.1、往上 0.1（中心在 (0.4, 0.4)，1280x720 為 x 384～640、y 216～360）；
     # 共用模組 ContinuousAutofocus_turbo 的預設（中央 30%）不變
@@ -868,14 +871,21 @@ def print_status(annotations, cam_state, af):
           f"Mode: {cam_state['mode']} | AF: {af_text}")
 
 
-def render_display(frame, annotations, bus_text, cam_state, focuser, af):
-    """Draw what main.py shows in its window onto a copy of the clean frame."""
+def render_display(frame, annotations, bus_text, cam_state, focuser, af, overlay=True):
+    """Draw what main.py shows in its window onto a copy of the clean frame.
+
+    overlay=False (--no-overlay) keeps only the bus and sign boxes: no labels,
+    status text or AF box.
+    """
     display = frame.copy()
     for (x1, y1, x2, y2), (rx1, ry1, rx2, ry2), label, color in annotations:
         cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.rectangle(display, (rx1, ry1), (rx2, ry2), (0, 0, 255), 2)
-        cv2.putText(display, label, (x1, max(25, y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        if overlay:
+            cv2.putText(display, label, (x1, max(25, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    if not overlay:
+        return display
 
     color = (0, 165, 255) if bus_text == "NONE" else (255, 0, 0)
     cv2.putText(
@@ -1188,8 +1198,8 @@ def main():
                 print(f"[{time.strftime('%H:%M:%S')}] BUS NUMBER: {bus_text}")
 
             if recorder is not None:
-                recorder.add(render_display(frame, annotations, bus_text,
-                                            cam_state, focuser, af), frame_time)
+                recorder.add(render_display(frame, annotations, bus_text, cam_state,
+                                            focuser, af, not args.no_overlay), frame_time)
 
             now = time.monotonic()
             if args.status_interval and now - status_time >= args.status_interval:
@@ -1204,8 +1214,8 @@ def main():
                 elif key in ("p", "P", " "):
                     print_status(annotations, cam_state, af)
                 elif key in ("c", "C"):
-                    save_snapshot(render_display(frame, annotations, bus_text,
-                                                 cam_state, focuser, af))
+                    save_snapshot(render_display(frame, annotations, bus_text, cam_state,
+                                                 focuser, af, not args.no_overlay))
                 else:
                     if key in REOPEN_KEYS:
                         # 手動改曝光 / FPS 會讓量到的亮度失準：以使用者的設定為準，維持白天參數
